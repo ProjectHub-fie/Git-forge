@@ -3,20 +3,13 @@ name: Build GitForge APKs
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-  release:
-    types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Build Debug and Release APKs
     runs-on: ubuntu-latest
 
     steps:
@@ -44,10 +37,7 @@ jobs:
         run: |
           ./gradlew --no-daemon :app:assembleDebug :app:assembleRelease
 
-      - name: Stage updater-compatible APK names
-        # The in-app updater selects app-debug.apk / app-release.apk (see
-        # UpdateModels.assetFor). Keep those exact names so the staged files
-        # match the channel contract instead of failing late after download.
+      - name: Stage APK files
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
           cp app/build/outputs/apk/release/app-release-unsigned.apk app-release.apk
@@ -59,17 +49,36 @@ jobs:
           path: |
             app-debug.apk
             app-release.apk
+          if-no-files-found: error
+          retention-days: 14
 
-      # The release APK here is unsigned (no keystore in CI): it proves the
-      # build compiles but cannot update an installed app. Attach the debug APK
-      # for testers; do NOT attach the unsigned release APK to a release.
-      - name: Attach debug APK to GitHub Release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
-        run: |
-          gh release upload "$TAG_NAME" \
-            app-debug.apk \
-            --clobber
+  email-notification:
+    name: Email Build Result
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
 
+    steps:
+      - name: Send build result email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "GitForge APK Build: ${{ needs.build.result }}"
+          to: ${{ secrets.MAIL_TO }}
+          from: "GitForge Build Bot <${{ secrets.MAIL_USERNAME }}>"
+          body: |
+            GitForge APK build has finished.
+
+            Result: ${{ needs.build.result }}
+            Repository: ${{ github.repository }}
+            Branch or ref: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+
+            Workflow run:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            ${{ needs.build.result == 'success' && 'The APK build completed. Download the GitForge-APKs artifact from this workflow run.' || 'The build failed or was cancelled. Open the workflow run link above to inspect the logs.' }}
