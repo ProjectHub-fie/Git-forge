@@ -71,8 +71,6 @@ fun PackagesScreen(
     onRunInTerminal: (String) -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    var installNode by remember { mutableStateOf(false) }
-    var installPython by remember { mutableStateOf(false) }
 
     // The repository path is loaded asynchronously because it needs a database read.
     var repoPath by remember(activeRepositoryId) { mutableStateOf<String?>(null) }
@@ -191,16 +189,12 @@ fun PackagesScreen(
             InstallCard(
                 state = state,
                 onInstallNode = {
-                    installNode = true
                     viewModel.requestInstall(setOf(RuntimeGroup.NODE))
                 },
                 onInstallPython = {
-                    installPython = true
                     viewModel.requestInstall(setOf(RuntimeGroup.PYTHON))
                 },
                 onInstallBoth = {
-                    installNode = true
-                    installPython = true
                     viewModel.requestInstall(setOf(RuntimeGroup.NODE, RuntimeGroup.PYTHON))
                 },
                 onUninstall = viewModel::requestUninstall,
@@ -283,6 +277,7 @@ fun PackagesScreen(
 
     if (state.pendingInstall != null) {
         InstallConfirmDialog(
+            container = container,
             groups = state.pendingInstall!!,
             onConfirm = viewModel::confirmInstall,
             onDismiss = viewModel::cancelInstallRequest,
@@ -513,11 +508,14 @@ private fun NpmShortcutsCard(
 
 @Composable
 private fun InstallConfirmDialog(
+    container: AppContainer,
     groups: Set<RuntimeGroup>,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val packages = groups.flatMap { RuntimePackageRegistry.packagesFor(it) } + RuntimePackageRegistry.commonPackages
+    // Quote the manager's own de-duplicated list: it already prepends the shared
+    // commonPackages once, so counting them again here would inflate the dialog.
+    val packages = container.runtimeManager.packagesFor(groups)
     val total = packages.sumOf { it.sizeBytes }
 
     androidx.compose.material3.AlertDialog(

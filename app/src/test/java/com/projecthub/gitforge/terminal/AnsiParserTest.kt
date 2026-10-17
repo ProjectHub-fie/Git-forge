@@ -77,6 +77,25 @@ class AnsiParserTest {
         assertTrue(result.lines.first().first.contains("before"))
         assertTrue(result.lines.first().first.contains("after"))
     }
+    @Test
+    fun `an SGR sequence split across chunks does not leak literally`() {
+        val first = parser.parse("\u001B[3", "")
+        val second = parser.parse("1mred\n", first.carry)
+        assertTrue(second.lines.any { it.first.contains("red") })
+        assertFalse((second.lines.map { it.first } + second.carry).any { it.contains("\u001B[3") })
+    }
+
+    @Test
+    fun `CRLF is one newline not an overwrite plus a newline`() {
+        val result = parser.parse("a\r\nb\r\n", "")
+        assertEquals(listOf("a", "b"), result.lines.map { it.first })
+    }
+
+    @Test
+    fun `a lone CR still overwrites the line`() {
+        val result = parser.parse("50%\r100%\n", "")
+        assertEquals("100%", result.lines.last().first)
+    }
 }
 
 /**

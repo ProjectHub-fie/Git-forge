@@ -38,6 +38,10 @@ data class UpdateRelease(
     val htmlUrl: String,
     val publishedAt: String,
     val assets: List<UpdateAsset>,
+    /** True when GitHub marks the release as a draft; never offered as an update. */
+    val isDraft: Boolean = false,
+    /** True when GitHub marks the release as a pre-release; offered only off STABLE. */
+    val isPrerelease: Boolean = false,
 ) {
     /**
      * The APK that matches the requested [channel]. A release carries both a signed
@@ -51,7 +55,8 @@ data class UpdateRelease(
         apks.firstOrNull { it.name.equals(channel.apkName, ignoreCase = true) }?.let { return it }
         return when (channel) {
             UpdateChannel.STABLE -> apks.firstOrNull { !it.name.contains("debug", ignoreCase = true) }
-            UpdateChannel.DEBUG -> apks.firstOrNull { it.name.contains("debug", ignoreCase = true) } ?: apks.firstOrNull()
+            // Never cross channels: a debug build waits for a debug APK.
+            UpdateChannel.DEBUG -> apks.firstOrNull { it.name.contains("debug", ignoreCase = true) }
         }
     }
 

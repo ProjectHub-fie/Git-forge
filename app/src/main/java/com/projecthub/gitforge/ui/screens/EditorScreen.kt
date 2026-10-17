@@ -113,8 +113,14 @@ fun EditorScreen(
     }
 
     // Warn when a terminal command changed a file that also has unsaved edits.
-    LaunchedEffect(state.tabs, state.repositoryRoot) {
-        val external = viewModel.externallyModifiedTabs()
+    // Keyed on tab count + dirtiness, not the tabs list object (recreated per
+    // keystroke), and only dirty tabs can produce a save conflict — a clean tab
+    // changed by pull/checkout just needs a reload, not a scary banner.
+    val dirtyFingerprints = state.tabs.filter { it.isDirty }.map { it.relativePath to it.lastModifiedOnDisk }
+    LaunchedEffect(dirtyFingerprints, state.repositoryRoot) {
+        if (dirtyFingerprints.isEmpty()) return@LaunchedEffect
+        kotlinx.coroutines.delay(500)
+        val external = viewModel.externallyModifiedTabs().filter { it.isDirty }
         if (external.isNotEmpty()) {
             viewModel.reportPathError(
                 java.io.IOException(
@@ -135,7 +141,7 @@ fun EditorScreen(
         EditorToolbar(
             repositoryName = state.repositoryName,
             activeTab = state.activeTab,
-            canSave = state.activeTab?.isDirty == true,
+            canSave = state.activeTab?.let { it.isDirty && !it.readOnly } == true,
             hasUnsaved = state.hasUnsavedChanges,
             onToggleExplorer = { showExplorer = !showExplorer },
             onSave = viewModel::saveActive,

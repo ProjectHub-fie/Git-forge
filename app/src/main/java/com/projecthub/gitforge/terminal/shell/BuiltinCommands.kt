@@ -59,15 +59,33 @@ class BuiltinRegistry(
         internal fun String.ensureTrailingNewline(): String =
             if (isEmpty() || endsWith("\n")) this else "$this\n"
 
-        internal fun readInput(ctx: ShellContext, args: List<String>, stdin: String): String {
+        /** Upper bound for a single builtin file read so `cat hugefile` cannot OOM. */
+        internal const val MAX_INPUT_BYTES = 2 * 1024 * 1024
+
+        internal fun readInput(
+            ctx: ShellContext,
+            args: List<String>,
+            stdin: String,
+            limit: Int = MAX_INPUT_BYTES,
+        ): String {
             val fileArgs = fileOperands(args)
-            if (fileArgs.isEmpty()) return stdin
+            if (fileArgs.isEmpty()) return stdin.take(limit)
             val sb = StringBuilder()
+            var remaining = limit
             for (path in fileArgs) {
                 val file = ctx.resolve(path)
                 if (!file.exists()) throw IOException("$path: No such file or directory")
                 if (file.isDirectory) throw IOException("$path: Is a directory")
-                sb.append(file.readText())
+                file.inputStream().buffered().reader(Charsets.UTF_8).use { reader ->
+                    val buf = CharArray(8192)
+                    while (remaining > 0) {
+                        val read = reader.read(buf, 0, minOf(buf.size, remaining))
+                        if (read <= 0) break
+                        sb.append(buf, 0, read)
+                        remaining -= read
+                    }
+                }
+                if (remaining <= 0) break
             }
             return sb.toString()
         }
@@ -125,7 +143,7 @@ private val CORE_BUILTINS: List<BuiltinCommand> = listOf(
         override suspend fun run(ctx: ShellContext, args: List<String>, stdin: String): ShellRunOutput {
             val target = when {
                 args.isEmpty() -> ctx.home
-                args[0] == "-" -> File(ctx.env["OLDPWD"] ?: ctx.home.absolutePath)
+                args[0] == "-" -> ctx.resolve(ctx.env["OLDPWD"] ?: ctx.home.absolutePath)
                 else -> ctx.resolve(args[0])
             }
             if (!target.exists()) return BuiltinRegistry.err("cd: ${args.firstOrNull()}: No such file or directory")
@@ -392,10 +410,17 @@ private val CORE_BUILTINS: List<BuiltinCommand> = listOf(
                 previous[key] = ctx.env[key]
                 ctx.env[key] = assignment.substringAfter('=')
             }
-            if (args.size == assignments.size) {
-                return BuiltinRegistry.ok(assignments.joinToString("\n") + "\n")
+            try {
+                if (args.size == assignments.size) {
+                    return BuiltinRegistry.ok(assignments.joinToString("\n") + "\n")
+                }
+                return BuiltinRegistry.err("env: running a command with a temporary environment is not supported; use export instead")
+            } finally {
+                // `env A=1 cmd` must not leak overrides into the session.
+                previous.forEach { (key, value) ->
+                    if (value == null) ctx.env.remove(key) else ctx.env[key] = value
+                }
             }
-            return BuiltinRegistry.err("env: running a command with a temporary environment is not supported; use export instead")
         }
     },
 

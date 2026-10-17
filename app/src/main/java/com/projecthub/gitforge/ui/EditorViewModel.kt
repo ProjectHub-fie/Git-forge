@@ -32,6 +32,7 @@ data class EditorTab(
     val lineEnding: LineEnding,
     val charsetName: String,
     val lastModifiedOnDisk: Long,
+    val onDiskSizeBytes: Long = -1L,
     val readOnly: Boolean = false,
     val truncated: Boolean = false,
     val loadError: String? = null,
@@ -249,10 +250,28 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
         val root = _state.value.repositoryRoot ?: return
         viewModelScope.launch {
             _state.update { it.copy(loadingTree = true) }
-            val entries = withContext(Dispatchers.IO) {
-                runCatching { container.fileTreeReader.list(root, relativeDir) }.getOrDefault(emptyList())
+            val result = withContext(Dispatchers.IO) {
+                runCatching { container.fileTreeReader.list(root, relativeDir) }
             }
-            _state.update { it.copy(loadingTree = false, currentDirectory = relativeDir, entries = entries) }
+            result
+                .onSuccess { entries ->
+                    _state.update {
+                        it.copy(
+                            loadingTree = false,
+                            currentDirectory = relativeDir,
+                            entries = entries,
+                            errorMessage = null,
+                        )
+                    }
+                }
+                .onFailure { failure ->
+                    _state.update {
+                        it.copy(
+                            loadingTree = false,
+                            errorMessage = failure.message ?: "Could not list $relativeDir",
+                        )
+                    }
+                }
         }
     }
 
@@ -289,7 +308,8 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
                         lineEnding = content.lineEnding,
                         charsetName = content.charsetName,
                         lastModifiedOnDisk = content.lastModified,
-                        readOnly = content.isBinary,
+                        onDiskSizeBytes = content.sizeBytes,
+                        readOnly = content.isBinary || content.truncated,
                         truncated = content.truncated,
                     )
                     _state.update { current ->
@@ -344,15 +364,24 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
                     lineEnding = tab.lineEnding,
                     charsetName = tab.charsetName,
                     expectedLastModified = tab.lastModifiedOnDisk,
+                    expectedSizeBytes = tab.onDiskSizeBytes.takeIf { it >= 0 },
                 )
             }
             when (result) {
                 is AppResult.Success -> {
-                    val onDisk = runCatching { File(root, tab.relativePath).lastModified() }.getOrDefault(0L)
+                    val onDisk = withContext(Dispatchers.IO) {
+                        runCatching { PathSafety.resolveInside(root, tab.relativePath) }
+                            .map { it.lastModified() to it.length() }
+                            .getOrDefault(0L to 0L)
+                    }
                     _state.update { s ->
                         val tabs = s.tabs.toMutableList()
                         if (index in tabs.indices) {
-                            tabs[index] = tabs[index].copy(savedText = tabs[index].text, lastModifiedOnDisk = onDisk)
+                            tabs[index] = tabs[index].copy(
+                                savedText = tabs[index].text,
+                                lastModifiedOnDisk = onDisk.first,
+                                onDiskSizeBytes = onDisk.second,
+                            )
                         }
                         s.copy(tabs = tabs, message = "Saved ${tab.displayName}")
                     }
@@ -364,16 +393,25 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    fun saveAll() {
+    /**
+     * Saves every dirty writable tab. Returns the launched [Job] so callers that
+     * must run after the saves (such as [saveAndRunPending]) can join it first.
+     * Fire-and-forget callers (for example a method reference) simply ignore the
+     * return value, so this stays a drop-in replacement for a Unit function.
+     */
+    fun saveAll(): Job {
         val dirty = _state.value.tabs.filter { it.isDirty && !it.readOnly }
         if (dirty.isEmpty()) {
             _state.update { it.copy(message = "Nothing to save.") }
-            return
+            // Return an already-completed job so join() is a no-op for the caller.
+            return viewModelScope.launch { }
         }
-        viewModelScope.launch {
+        return viewModelScope.launch {
             var saved = 0
             val failures = mutableListOf<String>()
+            val failedPaths = mutableSetOf<String>()
             val root = _state.value.repositoryRoot ?: return@launch
+            val refreshed = mutableMapOf<String, Pair<Long, Long>>()
             for (tab in dirty) {
                 val result = appResult {
                     container.fileOperations.write(
@@ -383,14 +421,30 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
                         lineEnding = tab.lineEnding,
                         charsetName = tab.charsetName,
                         expectedLastModified = tab.lastModifiedOnDisk,
+                        expectedSizeBytes = tab.onDiskSizeBytes.takeIf { it >= 0 },
                     )
                 }
-                if (result is AppResult.Success) saved++ else failures += tab.displayName
+                if (result is AppResult.Success) {
+                    saved++
+                    refreshed[tab.relativePath] = withContext(Dispatchers.IO) {
+                        runCatching { PathSafety.resolveInside(root, tab.relativePath) }
+                            .map { it.lastModified() to it.length() }
+                            .getOrDefault(0L to 0L)
+                    }
+                } else {
+                    failures += tab.displayName
+                    failedPaths += tab.relativePath
+                }
             }
             _state.update { s ->
                 val tabs = s.tabs.map { t ->
-                    if (t.isDirty && !t.readOnly && t.displayName !in failures) {
-                        t.copy(savedText = t.text, lastModifiedOnDisk = File(root, t.relativePath).lastModified())
+                    val stamp = refreshed[t.relativePath]
+                    if (stamp != null && t.isDirty && !t.readOnly && t.relativePath !in failedPaths) {
+                        t.copy(
+                            savedText = t.text,
+                            lastModifiedOnDisk = stamp.first,
+                            onDiskSizeBytes = stamp.second,
+                        )
                     } else {
                         t
                     }
@@ -445,9 +499,15 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
 
     fun saveAndRunPending() {
         val action = _state.value.pendingAction
-        saveAll()
-        _state.update { it.copy(unsavedPrompt = false, pendingAction = null) }
-        action?.invoke()
+        // Save first and only run the pending action once the saves landed:
+        // awaiting the job guarantees the file contents are on disk (or the
+        // failure message is shown) before the close proceeds.
+        val saveJob = saveAll()
+        viewModelScope.launch {
+            saveJob.join()
+            _state.update { it.copy(unsavedPrompt = false, pendingAction = null) }
+            action?.invoke()
+        }
     }
 
     // ------------------------------------------------------------ find / replace
@@ -615,6 +675,12 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
                                 lineEnding = content.lineEnding,
                                 charsetName = content.charsetName,
                                 lastModifiedOnDisk = content.lastModified,
+                                onDiskSizeBytes = content.sizeBytes,
+                                // A reloaded tab reflects the current on-disk content,
+                                // so a previously truncated/binary view becomes
+                                // editable again when the file now loads fully.
+                                readOnly = content.isBinary || content.truncated,
+                                truncated = content.truncated,
                             )
                         }
                         s.copy(tabs = tabs, message = "Reloaded ${tab.displayName} from disk")
@@ -629,8 +695,12 @@ class EditorViewModel(private val container: AppContainer) : ViewModel() {
     fun externallyModifiedTabs(): List<EditorTab> {
         val root = _state.value.repositoryRoot ?: return emptyList()
         return _state.value.tabs.filter { tab ->
-            val onDisk = File(root, tab.relativePath).lastModified()
-            onDisk > tab.lastModifiedOnDisk
+            val onDisk = runCatching { PathSafety.resolveInside(root, tab.relativePath) }.getOrNull()
+            // A missing file (deleted out from under the tab) always counts as a
+            // conflict: saving blindly would resurrect content the user removed.
+            if (onDisk == null || !onDisk.exists()) return@filter true
+            onDisk.lastModified() != tab.lastModifiedOnDisk ||
+                (tab.onDiskSizeBytes >= 0 && onDisk.length() != tab.onDiskSizeBytes)
         }
     }
 

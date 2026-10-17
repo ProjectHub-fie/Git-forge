@@ -25,6 +25,12 @@ import java.io.File
 class GitCommand(
     private val gitEngine: com.projecthub.gitforge.git.GitEngine,
     private val identityProvider: () -> Pair<String, String>,
+    /**
+     * Supplies the HTTPS credential for network calls. Defaults to null (no
+     * credential) so existing constructions keep compiling; AppContainer must
+     * pass `{ credentialStore.token() }` so fetch/pull/clone authenticate.
+     */
+    private val tokenProvider: () -> String? = { null },
 ) : ExternalCommand {
 
     override val name = "git"
@@ -199,7 +205,7 @@ class GitCommand(
                         0
                     }
                     flags.contains("-d") || flags.contains("-D") -> {
-                        gitEngine.deleteBranch(repositoryDir, names.first())
+                        gitEngine.deleteBranch(repositoryDir, names.first(), force = flags.contains("-D"))
                         emit("Deleted branch ${names.first()}\n")
                         0
                     }
@@ -247,13 +253,13 @@ class GitCommand(
             }
 
             "fetch" -> {
-                gitEngine.fetch(repositoryDir, null)
+                gitEngine.fetch(repositoryDir, tokenProvider())
                 emit("Fetched from origin\n")
                 0
             }
 
             "pull" -> {
-                gitEngine.pull(repositoryDir, null)
+                gitEngine.pull(repositoryDir, tokenProvider())
                 emit("Already up to date or merged successfully\n")
                 0
             }
@@ -268,24 +274,26 @@ class GitCommand(
 
             "rev-parse" -> {
                 val what = rest.firstOrNull() ?: "HEAD"
-                val repo = gitEngine.open(repositoryDir).repository
-                val resolved = when (what) {
-                    "--abbrev-ref" -> null
-                    "--show-toplevel" -> repositoryDir.absolutePath
-                    else -> repo.resolve(what)?.name
-                }
-                val output = if (rest.contains("--abbrev-ref")) {
-                    gitEngine.currentBranch(repo)
-                } else {
-                    resolved
-                }
-                repo.close()
-                if (output == null) {
-                    emit("fatal: ambiguous argument '$what'\n", TerminalLine.Stream.STDERR)
-                    128
-                } else {
-                    emit("$output\n")
-                    0
+                gitEngine.open(repositoryDir).use { git ->
+                    val repo = git.repository
+                    val resolved = when (what) {
+                        "--abbrev-ref" -> null
+                        "--show-toplevel" -> repositoryDir.absolutePath
+                        else -> repo.resolve(what)?.name
+                    }
+                    val output = if (rest.contains("--abbrev-ref")) {
+                        val ref = rest.getOrNull(rest.indexOf("--abbrev-ref") + 1) ?: "HEAD"
+                        if (ref == "HEAD") gitEngine.currentBranch(repo) else repo.resolve(ref)?.name
+                    } else {
+                        resolved
+                    }
+                    if (output == null) {
+                        emit("fatal: ambiguous argument '$what'\n", TerminalLine.Stream.STDERR)
+                        128
+                    } else {
+                        emit("$output\n")
+                        0
+                    }
                 }
             }
 

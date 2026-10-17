@@ -45,7 +45,38 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
             var exitCode = 1
 
             fun scan(file: File, label: String) {
-                val lines = runCatching { file.readLines() }.getOrNull() ?: return
+                // Cap the scan so a huge log cannot OOM the shell; note truncation.
+                val lines = runCatching {
+                    file.inputStream().buffered().reader(Charsets.UTF_8).use { reader ->
+                        val acc = mutableListOf<String>()
+                        var chars = 0
+                        val buf = CharArray(8192)
+                        val cur = StringBuilder()
+                        var truncated = false
+                        fun flushLine() {
+                            acc += cur.toString()
+                            cur.setLength(0)
+                        }
+                        while (true) {
+                            val n = reader.read(buf)
+                            if (n <= 0) break
+                            var k = 0
+                            while (k < n) {
+                                if (chars >= BuiltinRegistry.MAX_INPUT_BYTES) {
+                                    truncated = true
+                                    break
+                                }
+                                val c = buf[k++]
+                                chars++
+                                if (c == '\n') flushLine() else cur.append(c)
+                            }
+                            if (truncated) break
+                        }
+                        if (cur.isNotEmpty()) acc += cur.toString()
+                        if (acc.size > 200_000) acc.subList(200_000, acc.size).clear()
+                        acc
+                    }
+                }.getOrNull() ?: return
                 var hits = 0
                 lines.forEachIndexed { index, line ->
                     val isMatch = regex.containsMatchIn(line) != invert
@@ -63,15 +94,18 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                 if (hits > 0) {
                     exitCode = 0
                     if (filesOnly) out.append("$label\n")
-                    if (countOnly) out.append(if (label.isEmpty()) "$hits\n" else "$label:$hits\n")
                 }
+                // `grep -c` reports 0 for a file with no match, same as GNU grep.
+                if (countOnly) out.append(if (label.isEmpty()) "$hits\n" else "$label:$hits\n")
             }
 
             if (targets.isEmpty()) {
                 // Reading from stdin: behave like a filter.
+                var hits = 0
                 stdin.lines().forEachIndexed { index, line ->
                     val isMatch = regex.containsMatchIn(line) != invert
                     if (isMatch) {
+                        hits++
                         matched = true
                         exitCode = 0
                         if (countOnly || filesOnly) Unit
@@ -79,7 +113,7 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                         else out.append("$line\n")
                     }
                 }
-                if (countOnly) out.append("${if (matched) 1 else 0}\n")
+                if (countOnly) out.append("$hits\n")
             } else {
                 for (target in targets) {
                     val file = ctx.resolve(target)
@@ -204,7 +238,9 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
             val unique = args.any { it.startsWith("-") && it.contains('u') }
             return try {
                 var lines = BuiltinRegistry.readInput(ctx, args, stdin).lines()
-                lines = lines.filter { it.isNotEmpty() || true }
+                // .lines() on a trailing newline yields a final empty string;
+                // drop it so sorted output does not start with a blank line.
+                if (lines.isNotEmpty() && lines.last().isEmpty()) lines = lines.dropLast(1)
                 val sorted = if (numeric) {
                     lines.sortedBy { it.trim().substringBefore(' ').toDoubleOrNull() ?: Double.MAX_VALUE }
                 } else {
@@ -329,8 +365,13 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                 if (part.contains('-')) {
                     val (from, to) = part.split('-', limit = 2)
                     val start = from.toIntOrNull() ?: 1
-                    val end = to.toIntOrNull() ?: start
-                    for (i in start..end) result += i
+                    // Open-ended `2-` means "to end of line"; cap at Int.MAX so
+                    // callers selecting via getOrNull simply stop at the last field.
+                    val end = to.toIntOrNull() ?: Int.MAX_VALUE
+                    if (end >= start) {
+                        val capped = minOf(end, start + 4096)
+                        for (i in start..capped) result += i
+                    }
                 } else {
                     part.toIntOrNull()?.let { result += it }
                 }
@@ -460,6 +501,9 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
             if (!left.exists()) return BuiltinRegistry.err("diff: ${positional[0]}: No such file or directory", 2)
             if (!right.exists()) return BuiltinRegistry.err("diff: ${positional[1]}: No such file or directory", 2)
 
+            if (left.length() > BuiltinRegistry.MAX_INPUT_BYTES || right.length() > BuiltinRegistry.MAX_INPUT_BYTES) {
+                return BuiltinRegistry.err("diff: file too large for a line-by-line diff")
+            }
             val leftLines = left.readLines()
             val rightLines = right.readLines()
             val out = StringBuilder()
@@ -515,10 +559,9 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                         response.headers.forEach { (name, value) -> sb.append("$name: $value\n") }
                         return BuiltinRegistry.ok(sb.toString())
                     }
-                    val body = response.body?.string().orEmpty()
-                    if (!response.isSuccessful && !silent) {
-                        return ShellRunOutput(body, "curl: HTTP ${response.code} ${response.message}\n", 22)
-                    }
+                    // Stream with a cap: .string() would materialise binary bodies
+                    // fully in memory and corrupt them through charset decoding.
+                    val capBytes = 32L * 1024 * 1024
                     if (outputFile != null) {
                         val target = try {
                             ctx.resolveForWrite(outputFile)
@@ -526,11 +569,50 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                             return BuiltinRegistry.err("curl: ${e.message}")
                         }
                         target.parentFile?.mkdirs()
-                        target.writeText(body)
-                        val message = if (silent) "" else "Downloaded ${BuiltinRegistry.humanSize(body.length.toLong())} to $outputFile\n"
+                        val body = response.body ?: return BuiltinRegistry.err("curl: empty response body", 22)
+                        var written = 0L
+                        target.outputStream().use { out ->
+                            body.byteStream().use { input ->
+                                val buf = ByteArray(64 * 1024)
+                                while (true) {
+                                    val n = input.read(buf)
+                                    if (n <= 0) break
+                                    if (written + n > capBytes) {
+                                        return BuiltinRegistry.err("curl: response exceeds 32 MB cap", 22)
+                                    }
+                                    out.write(buf, 0, n)
+                                    written += n
+                                }
+                            }
+                        }
+                        if (!response.isSuccessful && !silent) {
+                            return ShellRunOutput("", "curl: HTTP ${response.code} ${response.message}\n", 22)
+                        }
+                        val message = if (silent) "" else "Downloaded ${BuiltinRegistry.humanSize(written)} to $outputFile\n"
                         BuiltinRegistry.ok(message)
                     } else {
-                        BuiltinRegistry.ok(body)
+                        val body = response.body ?: return BuiltinRegistry.err("curl: empty response body", 22)
+                        val sb = StringBuilder()
+                        var total = 0L
+                        body.byteStream().buffered().reader(Charsets.UTF_8).use { reader ->
+                            val buf = CharArray(16 * 1024)
+                            while (true) {
+                                val n = reader.read(buf)
+                                if (n <= 0) break
+                                if (total + n > 2 * 1024 * 1024) {
+                                    sb.append(buf, 0, (2 * 1024 * 1024 - total).toInt())
+                                    total = 2 * 1024 * 1024
+                                    break
+                                }
+                                sb.append(buf, 0, n)
+                                total += n
+                            }
+                        }
+                        val text = sb.toString()
+                        if (!response.isSuccessful && !silent) {
+                            return ShellRunOutput(text, "curl: HTTP ${response.code} ${response.message}\n", 22)
+                        }
+                        BuiltinRegistry.ok(text)
                     }
                 }
             } catch (e: Exception) {
@@ -551,9 +633,15 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
             for (target in targets) {
                 val file = ctx.resolve(target)
                 if (!file.exists()) return BuiltinRegistry.err("gzip: $target: No such file or directory")
+                if (decompress && !file.name.endsWith(".gz")) {
+                    return BuiltinRegistry.err("gzip: $target: unknown suffix -- ignored")
+                }
                 try {
                     if (decompress) {
                         val output = File(file.parentFile, file.name.removeSuffix(".gz"))
+                        if (output.canonicalFile == file.canonicalFile) {
+                            return BuiltinRegistry.err("gzip: $target: refusing to overwrite input")
+                        }
                         GZIPInputStream(file.inputStream()).use { input ->
                             output.outputStream().use { input.copyTo(it) }
                         }
@@ -607,7 +695,8 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                                 while (entry != null) {
                                     val current = entry
                                     val target = File(ctx.cwd, current.name).canonicalFile
-                                    if (!target.path.startsWith(ctx.cwd.canonicalPath)) {
+                                    val cwdCanonical = ctx.cwd.canonicalPath
+                                    if (target.path != cwdCanonical && !target.path.startsWith(cwdCanonical + File.separator)) {
                                         return BuiltinRegistry.err("tar: refusing to extract '${current.name}' outside the working directory")
                                     }
                                     if (current.isDirectory) {
@@ -685,7 +774,8 @@ internal val TEXT_BUILTINS: List<BuiltinCommand> = listOf(
                             out.append("%10d  %s\n".format(current.size.coerceAtLeast(0), current.name))
                         } else {
                             val target = File(destination, current.name).canonicalFile
-                            if (!target.path.startsWith(destination.canonicalPath)) {
+                            val destCanonical = destination.canonicalPath
+                            if (target.path != destCanonical && !target.path.startsWith(destCanonical + File.separator)) {
                                 return BuiltinRegistry.err("unzip: refusing to extract '${current.name}' outside the destination")
                             }
                             if (current.isDirectory) {

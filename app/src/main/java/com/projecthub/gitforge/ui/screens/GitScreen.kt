@@ -301,13 +301,16 @@ fun GitScreen(
             title = { Text("Merge conflicts") },
             text = {
                 Column {
-                    Text("These files contain conflicts and must be resolved before committing:")
+                    Text("These files contain conflicts. Resolve them and commit, or abort the merge to restore HEAD:")
                     Spacer(Modifier.height(8.dp))
                     paths.forEach { Text(it, style = CodeTextStyle) }
                 }
             },
             confirmButton = {
                 TextButton(onClick = { viewModel.refresh() }) { Text("Refresh status") }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.abortMerge() }) { Text("Abort merge") }
             },
         )
     }

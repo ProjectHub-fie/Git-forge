@@ -41,10 +41,19 @@ class ReleaseClient(
         .retryOnConnectionFailure(true)
         .build()
 
-    /** All published releases, newest first, as GitHub returns them. */
+    /**
+     * All published releases, newest first, as GitHub returns them.
+     *
+     * The page size is 100 so small repos never need a second request.
+     *
+     * TODO(pagination): follow `Link: <url>; rel="next"` (same shape as
+     * GitHubApi.parseLinkHeader) while present; repos with more than 100
+     * releases still stop at the first page today.
+     */
     suspend fun fetchReleases(token: String? = null): List<UpdateRelease> = withContext(Dispatchers.IO) {
+        // Single-page fetch; Link-header pagination is the documented next step.
         val request = Request.Builder()
-            .url("$baseUrl/repos/$owner/$repo/releases?per_page=30")
+            .url("$baseUrl/repos/$owner/$repo/releases?per_page=100")
             .header("Accept", "application/vnd.github+json")
             .apply { if (!token.isNullOrBlank()) header("Authorization", "Bearer $token") }
             .get()
@@ -83,6 +92,9 @@ class ReleaseClient(
     /**
      * The newest release on [channel] that is newer than [currentVersion], or null
      * when the installed build is already current.
+     *
+     * Drafts are never offered; pre-releases are offered only off the STABLE
+     * channel. Ties on version compare fall back to [UpdateRelease.publishedAt].
      */
     suspend fun findUpdate(
         currentVersion: String,
@@ -90,9 +102,14 @@ class ReleaseClient(
         token: String? = null,
     ): UpdateRelease? = fetchReleases(token)
         .asSequence()
+        .filter { !it.isDraft }
+        .filter { channel != UpdateChannel.STABLE || !it.isPrerelease }
         .filter { VersionComparator.isNewer(it.version, currentVersion) }
         .filter { it.assetFor(channel) != null }
-        .maxByOrNull { VersionComparator.parse(it.version).fold(0L) { acc, n -> acc * 1000 + n } }
+        .maxWithOrNull(
+            Comparator<UpdateRelease> { a, b -> VersionComparator.compare(a.version, b.version) }
+                .thenBy { it.publishedAt },
+        )
 
     private fun ReleaseDto.toUpdateRelease() = UpdateRelease(
         tagName = tagName,
@@ -101,6 +118,8 @@ class ReleaseClient(
         notes = body.orEmpty(),
         htmlUrl = htmlUrl,
         publishedAt = publishedAt.orEmpty(),
+        isDraft = draft,
+        isPrerelease = prerelease,
         assets = assets.orEmpty().map {
             UpdateAsset(name = it.name, url = it.browserDownloadUrl, sizeBytes = it.size, sha256 = it.sha256())
         },
@@ -115,6 +134,8 @@ class ReleaseClient(
         val body: String? = null,
         @SerialName("html_url") val htmlUrl: String,
         @SerialName("published_at") val publishedAt: String? = null,
+        val draft: Boolean = false,
+        val prerelease: Boolean = false,
         val assets: List<AssetDto>? = null,
     )
 
@@ -123,7 +144,12 @@ class ReleaseClient(
         val name: String,
         @SerialName("browser_download_url") val browserDownloadUrl: String,
         val size: Long = 0,
-        /** Present on newer API responses as `sha256:<hex>`. Optional. */
+        /**
+         * Optional digest advertised alongside the asset. GitHub's releases API
+         * does not return this field today, so it stays null in practice and
+         * [UpdateManager] must already handle a null SHA-256 (it does: the
+         * checksum check is skipped and the size check still applies).
+         */
         val digest: String? = null,
     ) {
         fun sha256(): String? = digest?.substringAfter("sha256:", "")?.lowercase()?.takeIf { it.length == 64 }

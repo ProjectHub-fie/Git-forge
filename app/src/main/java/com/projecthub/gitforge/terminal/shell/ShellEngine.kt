@@ -7,7 +7,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
 
@@ -25,7 +24,7 @@ import java.io.IOException
 class ShellEngine(
     private val builtins: BuiltinRegistry,
     private val resolver: CommandResolver,
-    private val scope: CoroutineScope,
+    @Suppress("UNUSED_PARAMETER") scope: CoroutineScope,
 ) {
 
     @Volatile
@@ -50,8 +49,8 @@ class ShellEngine(
         if (trimmed.isEmpty()) return ShellRunOutput("", "", 0)
         if (ctx.history.lastOrNull() != trimmed) ctx.history += trimmed
 
-        val job = scope.launch { }
-        activeJob = job
+        // Track the caller's own coroutine job so cancel() interrupts real work.
+        activeJob = currentCoroutineContext()[Job]
 
         val result = try {
             val tokens = ShellLexer.tokenize(trimmed)
@@ -61,6 +60,7 @@ class ShellEngine(
                     Token.Word(
                         ShellLexer.expand(token, env, ctx.lastExitCode, ctx.home.absolutePath),
                         token.quoted,
+                        token.singleQuoted,
                     )
                 } else {
                     token
@@ -97,10 +97,37 @@ class ShellEngine(
             currentCoroutineContext().ensureActive()
             val isLast = index == pipeline.stages.lastIndex
 
+            // `< file` feeds the stage; a missing file is a stage error, not silence.
+            var stageStdin = stdin
+            var stdinError: ShellRunOutput? = null
+            stage.stdinFile?.let { raw ->
+                val resolved = try {
+                    ctx.resolve(raw.path)
+                } catch (e: IOException) {
+                    stdinError = ShellRunOutput("", "shell: ${e.message}\n", 1)
+                    return@let
+                }
+                if (!resolved.isFile) {
+                    stdinError = ShellRunOutput(
+                        "",
+                        "shell: ${raw.path}: No such file or directory\n",
+                        1,
+                    )
+                } else {
+                    stageStdin = CappedReader.read(resolved, MAX_PIPELINE_BYTES)
+                }
+            }
+            if (stdinError != null) {
+                lastResult = applyRedirections(ctx, stage, stdinError!!)
+                stdin = ""
+                return@forEachIndexed
+            }
+
             // Each stream is redirected independently, so `cmd 2> err.txt` must still
             // print stdout. Only the streams that are not redirected go to the screen.
+            // Non-final stderr is forwarded live so `middle 2>err | cat` still shows errors.
             val stdoutToTerminal = isLast && stage.stdoutFile == null
-            val stderrToTerminal = isLast && stage.stderrFile == null
+            val stderrToTerminal = stage.stderrFile == null
             val emit: (String, TerminalLine.Stream) -> Unit = { chunk, stream ->
                 val allowed = when (stream) {
                     TerminalLine.Stream.STDERR -> stderrToTerminal
@@ -109,7 +136,7 @@ class ShellEngine(
                 if (allowed) onOutput(chunk, stream)
             }
 
-            val outcome = runStage(ctx, stage, stdin, emit)
+            val outcome = runStage(ctx, stage, stageStdin, emit)
             val result = applyRedirections(ctx, stage, outcome.result)
 
             // Builtins run in-process and return their stdout/stderr instead of
@@ -124,12 +151,13 @@ class ShellEngine(
                 }
             }
 
-            lastResult = result
-            val (capped, truncated) = StreamLimiter.limit(result.stdout)
-            if (truncated && isLast) {
+            val (cappedOut, outTruncated) = StreamLimiter.limit(result.stdout)
+            val (cappedErr, errTruncated) = StreamLimiter.limit(result.stderr)
+            if ((outTruncated || errTruncated) && isLast) {
                 onOutput("\nshell: pipeline output truncated at 2 MB\n", TerminalLine.Stream.SYSTEM)
             }
-            stdin = capped
+            lastResult = result.copy(stdout = cappedOut, stderr = cappedErr)
+            stdin = cappedOut
         }
         return lastResult
     }
@@ -145,7 +173,7 @@ class ShellEngine(
     ): StageOutcome {
         if (stage.words.isEmpty()) return StageOutcome(ShellRunOutput("", "", 0), streamedLive = false)
 
-        val words = expandGlobs(stage.words, ctx.cwd)
+        val words = expandGlobs(stage.words, ctx.cwd, stage.quoted)
         val aliased = resolver.resolveAlias(words)
         val name = aliased.first()
         val args = aliased.drop(1)
@@ -190,9 +218,9 @@ class ShellEngine(
         return StageOutcome(ShellRunOutput("", "$name: $hint\n", 127), streamedLive = false)
     }
 
-    /** Expands `*`/`?` patterns against the session working directory. */
-    private fun expandGlobs(words: List<String>, cwd: File): List<String> =
-        GlobExpander.expand(words, cwd)
+    /** Expands `*`/`?`/`[...]` in unquoted words against the working directory. */
+    private fun expandGlobs(words: List<String>, cwd: File, quoted: List<Boolean> = emptyList()): List<String> =
+        GlobExpander.expand(words, cwd, quoted)
 
     /** Applies `>` `>>` `2>` `2>>` for a stage, clearing only the streams it wrote. */
     private fun applyRedirections(
@@ -241,4 +269,23 @@ class ShellEngine(
 object StreamLimiter {
     fun limit(text: String, limit: Int = ShellEngine.MAX_PIPELINE_BYTES): Pair<String, Boolean> =
         if (text.length <= limit) text to false else text.take(limit) to true
+}
+
+/** Reads stdin files with the same 2 MB cap as pipeline output. */
+internal object CappedReader {
+    fun read(file: File, limit: Int = ShellEngine.MAX_PIPELINE_BYTES): String {
+        // Read incrementally so a huge file never materialises fully in memory.
+        val sb = StringBuilder()
+        file.inputStream().buffered().reader(Charsets.UTF_8).use { reader ->
+            val buf = CharArray(8192)
+            var remaining = limit
+            while (remaining > 0) {
+                val read = reader.read(buf, 0, minOf(buf.size, remaining))
+                if (read <= 0) break
+                sb.append(buf, 0, read)
+                remaining -= read
+            }
+        }
+        return sb.toString()
+    }
 }

@@ -144,12 +144,14 @@ fun SettingsScreen(
         item {
             SettingsCard {
                 Column {
+                    var fontSizeDraft by remember(settings.editorFontSizeSp) { mutableStateOf(settings.editorFontSizeSp.toFloat()) }
                     SliderRow(
-                        title = "Font size: ${settings.editorFontSizeSp}sp",
-                        value = settings.editorFontSizeSp.toFloat(),
+                        title = "Font size: ${fontSizeDraft.toInt()}sp",
+                        value = fontSizeDraft,
                         range = AppSettings.MIN_EDITOR_FONT_SP.toFloat()..AppSettings.MAX_EDITOR_FONT_SP.toFloat(),
                         steps = AppSettings.MAX_EDITOR_FONT_SP - AppSettings.MIN_EDITOR_FONT_SP - 1,
-                        onValueChange = { scope.launch { container.settingsRepository.setEditorFontSize(it.toInt()) } },
+                        onValueChange = { fontSizeDraft = it },
+                        onValueChangeFinished = { scope.launch { container.settingsRepository.setEditorFontSize(fontSizeDraft.toInt()) } },
                     )
                     RowDivider()
                     SwitchRow(
@@ -166,12 +168,14 @@ fun SettingsScreen(
                         onCheckedChange = { scope.launch { container.settingsRepository.setEditorSoftWrap(it) } },
                     )
                     RowDivider()
+                    var tabSizeDraft by remember(settings.editorTabSize) { mutableStateOf(settings.editorTabSize.toFloat()) }
                     SliderRow(
-                        title = "Tab size: ${settings.editorTabSize}",
-                        value = settings.editorTabSize.toFloat(),
+                        title = "Tab size: ${tabSizeDraft.toInt()}",
+                        value = tabSizeDraft,
                         range = 1f..8f,
                         steps = 6,
-                        onValueChange = { scope.launch { container.settingsRepository.setEditorTabSize(it.toInt()) } },
+                        onValueChange = { tabSizeDraft = it },
+                        onValueChangeFinished = { scope.launch { container.settingsRepository.setEditorTabSize(tabSizeDraft.toInt()) } },
                     )
                 }
             }
@@ -194,12 +198,14 @@ fun SettingsScreen(
                         }
                     }
                     RowDivider()
+                    var scrollbackDraft by remember(settings.terminalScrollbackLines) { mutableStateOf(settings.terminalScrollbackLines.toFloat()) }
                     SliderRow(
-                        title = "Scrollback: ${settings.terminalScrollbackLines} lines",
-                        value = settings.terminalScrollbackLines.toFloat(),
+                        title = "Scrollback: ${scrollbackDraft.toInt()} lines",
+                        value = scrollbackDraft,
                         range = AppSettings.MIN_SCROLLBACK.toFloat()..AppSettings.MAX_SCROLLBACK.toFloat(),
                         steps = 0,
-                        onValueChange = { scope.launch { container.settingsRepository.setTerminalScrollback(it.toInt()) } },
+                        onValueChange = { scrollbackDraft = it },
+                        onValueChangeFinished = { scope.launch { container.settingsRepository.setTerminalScrollback(scrollbackDraft.toInt()) } },
                     )
                     Text(
                         "Older output is dropped once the limit is reached, which keeps memory use bounded.",
@@ -509,19 +515,17 @@ fun SettingsScreen(
             onDismiss = { showTokenDialog = false },
             onSave = { token ->
                 scope.launch {
-                    container.credentialStore.save(token, null, null, "bearer")
-                    // Verify the token before the user relies on it: a token that
-                    // GitHub rejects is worse than no token, because it looks signed in.
-                    runCatching { container.gitHubApi.currentUser() }
-                        .onSuccess { user ->
-                            container.credentialStore.save(token, user.login, null, "bearer")
-                            repositoriesViewModel.refreshGitHubState()
-                            repositoriesViewModel.loadRemoteRepositories(reset = true)
-                        }
-                        .onFailure {
-                            container.credentialStore.clear()
-                            repositoriesViewModel.refreshGitHubState()
-                        }
+                    // Verify before persisting: a token GitHub rejects is worse than
+                    // no token, and saving first would wipe a good token on flaky net.
+                    val probe = com.projecthub.gitforge.github.GitHubApi(tokenProvider = { token })
+                    val login = runCatching { probe.currentUser().login }.getOrNull()
+                    if (login != null) {
+                        container.credentialStore.save(token, login, null, "bearer")
+                        repositoriesViewModel.refreshGitHubState()
+                        repositoriesViewModel.loadRemoteRepositories(reset = true)
+                    } else {
+                        repositoriesViewModel.refreshGitHubState()
+                    }
                     showTokenDialog = false
                 }
             },
@@ -616,12 +620,14 @@ private fun SliderRow(
     range: ClosedFloatingPointRange<Float>,
     steps: Int,
     onValueChange: (Float) -> Unit,
+    onValueChangeFinished: (() -> Unit)? = null,
 ) {
     Column(Modifier.padding(vertical = 4.dp)) {
         Text(title, style = MaterialTheme.typography.bodyMedium)
         Slider(
             value = value,
             onValueChange = onValueChange,
+            onValueChangeFinished = onValueChangeFinished,
             valueRange = range,
             steps = steps.coerceAtLeast(0),
         )
@@ -653,45 +659,48 @@ private fun DeviceFlowDialog(
     onSuccess: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    // Opens the browser once per flow, when the code first arrives. Keyed on the state
-    // so a recomposition does not reopen the browser or relaunch the flow.
-    androidx.compose.runtime.LaunchedEffect(state) {
-        if (state is DeviceFlowUiState.Waiting) {
-            onCopyCode(state.userCode)
-            onOpenBrowser(state.verificationUri)
+    // Opens the browser once per flow, when the code first arrives. Keyed on the
+    // user code so a recomposition does not reopen the browser.
+    val waiting = state as? DeviceFlowUiState.Waiting
+    androidx.compose.runtime.LaunchedEffect(waiting?.userCode) {
+        if (waiting != null) {
+            onCopyCode(waiting.userCode)
+            onOpenBrowser(waiting.verificationUri)
         }
     }
 
-    androidx.compose.runtime.LaunchedEffect(state) {
-        if (state is DeviceFlowUiState.Preparing) {
-            val result = runCatching {
-                val deviceCode = container.deviceFlowAuth.start()
-                onStateChange(
-                    DeviceFlowUiState.Waiting(
-                        userCode = deviceCode.userCode,
-                        verificationUri = deviceCode.verificationUri,
-                        remainingSeconds = deviceCode.expiresInSeconds,
-                    ),
-                )
-                container.deviceFlowAuth.awaitToken(
-                    deviceCode = deviceCode.deviceCode,
-                    intervalSeconds = deviceCode.intervalSeconds,
-                    expiresInSeconds = deviceCode.expiresInSeconds,
-                )
-            }
-            result.onSuccess { token ->
-                container.credentialStore.save(
-                    token = token.accessToken,
-                    login = runCatching { container.gitHubApi.currentUser().login }.getOrNull(),
-                    scopes = token.scope,
-                    tokenType = token.tokenType,
-                )
-                onSuccess()
-            }.onFailure { error ->
-                onStateChange(
-                    DeviceFlowUiState.Failed(error.message ?: "GitHub sign-in failed."),
-                )
-            }
+    // Starts the flow and polls exactly once per dialog instance. Keyed on Unit —
+    // never on `state` — so the Preparing -> Waiting transition cannot cancel the
+    // poll it just started.
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        if (state !is DeviceFlowUiState.Preparing) return@LaunchedEffect
+        try {
+            val deviceCode = container.deviceFlowAuth.start()
+            onStateChange(
+                DeviceFlowUiState.Waiting(
+                    userCode = deviceCode.userCode,
+                    verificationUri = deviceCode.verificationUri,
+                    remainingSeconds = deviceCode.expiresInSeconds,
+                ),
+            )
+            val token = container.deviceFlowAuth.awaitToken(
+                deviceCode = deviceCode.deviceCode,
+                intervalSeconds = deviceCode.intervalSeconds,
+                expiresInSeconds = deviceCode.expiresInSeconds,
+            )
+            container.credentialStore.save(
+                token = token.accessToken,
+                login = runCatching { container.gitHubApi.currentUser().login }.getOrNull(),
+                scopes = token.scope,
+                tokenType = token.tokenType,
+            )
+            onSuccess()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            onStateChange(
+                DeviceFlowUiState.Failed(e.message ?: "GitHub sign-in failed."),
+            )
         }
     }
 

@@ -32,9 +32,17 @@ class VersionComparatorTest {
     }
 
     @Test
-    fun `pre-release and build metadata do not change the ordering`() {
-        assertEquals(0, VersionComparator.compare("1.1.0-rc1", "1.1.0"))
+    fun `a release outranks its own pre-release but build metadata is ignored`() {
+        assertTrue(VersionComparator.compare("1.1.0-rc1", "1.1.0") < 0)
+        assertTrue(VersionComparator.isNewer("1.1.0", "1.1.0-rc1"))
+        assertFalse(VersionComparator.isNewer("1.1.0-rc1", "1.1.0"))
         assertEquals(0, VersionComparator.compare("1.1.0+build7", "1.1.0"))
+    }
+
+    @Test
+    fun `huge numeric components cap instead of overflowing to zero`() {
+        assertTrue(VersionComparator.isNewer("1.99999999999", "1.9"))
+        assertEquals(0, VersionComparator.compare("1.99999999999", "1.99999999999"))
     }
 
     @Test

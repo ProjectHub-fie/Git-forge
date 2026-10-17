@@ -13,6 +13,9 @@ import org.eclipse.jgit.transport.CredentialItem
 import org.eclipse.jgit.transport.CredentialsProvider
 import org.eclipse.jgit.transport.URIish
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
+import com.projecthub.gitforge.security.GitRemoteCredentials
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /** Raised for every Git failure so the UI always receives a classified [ErrorKind]. */
@@ -65,7 +68,13 @@ class GitEngine {
     /** Runs [block] while holding the repository lock, so Git operations serialise. */
     suspend fun <T> withLock(repositoryDir: File, block: suspend () -> T): T {
         val mutex = lockFor(repositoryDir.canonicalPath)
-        return mutex.withLockCompat(block)
+        return mutex.withLockCompat {
+            // JGit does blocking filesystem and network I/O. Run it on the IO
+            // dispatcher no matter which thread the caller is on (usually Main).
+            // Holding the mutex across the dispatcher switch is safe: it is a
+            // coroutine mutex, not bound to any thread.
+            withContext(Dispatchers.IO) { block() }
+        }
     }
 
     fun isRepository(dir: File): Boolean = File(dir, ".git").exists() || RepositoryCacheHolder.exists(dir)
@@ -239,7 +248,17 @@ class GitEngine {
                 val command = git.branchCreate().setName(name)
                 if (checkout) command.setUpstreamMode(org.eclipse.jgit.api.CreateBranchCommand.SetupUpstreamMode.NOTRACK)
                 command.call()
-                if (checkout) git.checkout().setName(name).call()
+                if (checkout) {
+                    try {
+                        git.checkout().setName(name).call()
+                    } catch (checkoutFailure: Throwable) {
+                        // The branch now exists but the checkout failed: roll the
+                        // ref back so a retry reports "could not create" truthfully
+                        // instead of "already exists".
+                        runCatching { git.branchDelete().setBranchNames(name).setForce(true).call() }
+                        throw checkoutFailure
+                    }
+                }
             } catch (t: Throwable) {
                 throw t.asGitException("Could not create branch $name")
             }
@@ -271,7 +290,12 @@ class GitEngine {
         }
     }
 
-    suspend fun deleteBranch(repositoryDir: File, name: String) = withLock(repositoryDir) {
+    /**
+     * Deletes a local branch. [force] maps to `git branch -D`: only the terminal
+     * passes true; the Git screen always deletes without force so commits that
+     * exist only on the deleted branch stay recoverable.
+     */
+    suspend fun deleteBranch(repositoryDir: File, name: String, force: Boolean = false) = withLock(repositoryDir) {
         validateRefName(name)
         open(repositoryDir).use { git ->
             val current = currentBranch(git.repository)
@@ -279,7 +303,7 @@ class GitEngine {
                 throw GitOperationException(ErrorKind.VALIDATION, "Cannot delete the branch you are on")
             }
             try {
-                git.branchDelete().setBranchNames(name).setForce(false).call()
+                git.branchDelete().setBranchNames(name).setForce(force).call()
             } catch (t: Throwable) {
                 throw t.asGitException("Could not delete branch $name")
             }
@@ -368,8 +392,19 @@ class GitEngine {
         open(repositoryDir).use { git ->
 
             try {
+                // Never persist credentials: strip any userinfo the caller pasted
+                // (for example a personal access token in an HTTPS URL) so
+                // `.git/config` keeps the bare URL and pushes authenticate via the
+                // per-call credential provider instead.
+                val cleanUrl = GitRemoteCredentials.stripCredentials(url.trim())
+                if (cleanUrl != url.trim()) {
+                    AppLog.w("Stripped credentials from the remote URL before storing it")
+                }
+                require(cleanUrl.startsWith("https://", ignoreCase = true)) {
+                    "Remote URL must use https://"
+                }
                 val config = git.repository.config
-                config.setString("remote", name, "url", url)
+                config.setString("remote", name, "url", cleanUrl)
                 config.setString("remote", name, "fetch", "+refs/heads/*:refs/remotes/$name/*")
                 config.save()
             } catch (t: Throwable) {
@@ -427,7 +462,8 @@ class GitEngine {
                         rejectedRefs = results.flatMap { result ->
                             result.remoteUpdates
                                 .filter { update ->
-                                    update.status == org.eclipse.jgit.transport.RemoteRefUpdate.Status.REJECTED_NONFASTFORWARD
+                                    update.status != org.eclipse.jgit.transport.RemoteRefUpdate.Status.OK &&
+                                        update.status != org.eclipse.jgit.transport.RemoteRefUpdate.Status.UP_TO_DATE
                                 }
                                 .map { update -> update.remoteName }
                         },
@@ -443,9 +479,47 @@ class GitEngine {
 
     // --------------------------------------------------------------- merge/revert
 
+    /**
+     * Aborts an in-progress merge (`git merge --abort`): resets the working tree
+     * to HEAD and clears the MERGE_HEAD state. Safe to call when no merge is in
+     * progress only in the sense that JGit will fail with no MERGE_HEAD, which is
+     * surfaced as an error — the UI should only offer this while conflicts exist.
+     */
+    suspend fun abortMerge(repositoryDir: File) = withLock(repositoryDir) {
+        open(repositoryDir).use { git ->
+            try {
+                git.reset()
+                    .setMode(org.eclipse.jgit.api.ResetCommand.ResetType.HARD)
+                    .setRef("HEAD")
+                    .call()
+                // A hard reset restores the tree but JGit leaves the merge
+                // bookkeeping behind; remove it so the repo is usable again.
+                // (This mirrors `git merge --abort`: reset + clear MERGE_* state.)
+                val gitDir = git.repository.directory
+                for (name in listOf("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "ORIG_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")) {
+                    runCatching { File(gitDir, name).delete() }
+                }
+            } catch (t: Throwable) {
+                throw t.asGitException("Could not abort the merge")
+            }
+        }
+    }
+
     suspend fun merge(repositoryDir: File, branchName: String): MergeOutcome = withLock(repositoryDir) {
         open(repositoryDir).use { git ->
             try {
+                if (File(git.repository.directory, "MERGE_HEAD").exists()) {
+                    throw GitOperationException(
+                        ErrorKind.CONFLICT,
+                        "A merge is already in progress. Resolve its conflicts or abort it before starting another merge.",
+                    )
+                }
+                if (!git.status().call().isClean) {
+                    throw GitOperationException(
+                        ErrorKind.CONFLICT,
+                        "Uncommitted changes are present. Commit or discard them before merging.",
+                    )
+                }
                 val ref = git.repository.resolve(branchName)
                     ?: git.repository.resolve("refs/remotes/origin/$branchName")
                     ?: throw GitOperationException(ErrorKind.NOT_FOUND, "Branch $branchName not found")
@@ -491,9 +565,9 @@ class GitEngine {
     /** Translates JGit's merge status name into the app's own enum. */
     private fun jgitMergeStatus(name: String): MergeStatus = when (name) {
         "ALREADY_UP_TO_DATE" -> MergeStatus.ALREADY_UP_TO_DATE
-        "FAST_FORWARD" -> MergeStatus.FAST_FORWARD
-        "MERGED" -> MergeStatus.MERGED
-        "CONFLICTING" -> MergeStatus.CONFLICTING
+        "FAST_FORWARD", "FAST_FORWARD_SQUASHED" -> MergeStatus.FAST_FORWARD
+        "MERGED", "MERGED_SQUASHED" -> MergeStatus.MERGED
+        "CONFLICTING", "CHECKOUT_CONFLICT" -> MergeStatus.CONFLICTING
         else -> MergeStatus.FAILED
     }
 
@@ -519,23 +593,26 @@ class GitEngine {
         val local = repository.resolve("refs/heads/$branch") ?: return 0 to 0
         val remote = repository.resolve("refs/remotes/origin/$branch") ?: return 0 to 0
         return try {
-            val counts = repository.newObjectReader().use { reader ->
-                val walk = org.eclipse.jgit.revwalk.RevWalk(reader)
-                val localCommit = walk.parseCommit(local)
-                val remoteCommit = walk.parseCommit(remote)
-                walk.reset()
-                walk.markStart(localCommit)
-                walk.markUninteresting(remoteCommit)
-                val ahead = walk.count()
+            repository.newObjectReader().use { reader ->
+                // RevWalk is AutoCloseable: it must be closed to release the
+                // object reader it borrows, hence the nested use{} blocks.
+                org.eclipse.jgit.revwalk.RevWalk(reader).use { walk ->
+                    val localCommit = walk.parseCommit(local)
+                    val remoteCommit = walk.parseCommit(remote)
+                    walk.reset()
+                    walk.markStart(localCommit)
+                    walk.markUninteresting(remoteCommit)
+                    val ahead = walk.count()
 
-                walk.reset()
-                walk.markStart(remoteCommit)
-                walk.markUninteresting(localCommit)
-                val behind = walk.count()
-                ahead to behind
+                    walk.reset()
+                    walk.markStart(remoteCommit)
+                    walk.markUninteresting(localCommit)
+                    val behind = walk.count()
+                    ahead to behind
+                }
             }
-            counts
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            AppLog.w("Could not compute ahead/behind for $branch", t)
             0 to 0
         }
     }

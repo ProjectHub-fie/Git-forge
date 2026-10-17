@@ -34,6 +34,7 @@ abstract class UserspaceCommand(
         args: List<String>,
         onOutput: (String, TerminalLine.Stream) -> Unit,
         extraEnv: Map<String, String> = emptyMap(),
+        stdin: String = "",
     ): ShellRunOutput {
         val executable = executablePath()
             ?: return ShellRunOutput("", "${name}: ${missingMessage()}\n", 127)
@@ -44,6 +45,7 @@ abstract class UserspaceCommand(
             args = args,
             workingDirectory = ctx.cwd,
             environment = environment,
+            stdin = stdin,
             onOutput = onOutput,
         )
 
@@ -84,7 +86,7 @@ class PythonCommand(runtimeManager: RuntimeManager) : UserspaceCommand(runtimeMa
             "PYTHONPYCACHEPREFIX" to cacheDir.absolutePath,
             "PYTHONDONTWRITEBYTECODE" to "0",
         )
-        return runProcess(ctx, args, onOutput, environment)
+        return runProcess(ctx, args, onOutput, environment, stdin)
     }
 }
 
@@ -112,7 +114,7 @@ class PipCommand(runtimeManager: RuntimeManager) : UserspaceCommand(runtimeManag
             "PIP_DISABLE_PIP_VERSION_CHECK" to "1",
             "PIP_NO_INPUT" to "1",
         )
-        return runProcess(ctx, args, onOutput, environment)
+        return runProcess(ctx, args, onOutput, environment, stdin)
     }
 }
 
@@ -144,7 +146,7 @@ class NodeCommand(runtimeManager: RuntimeManager) : UserspaceCommand(runtimeMana
             // an unbounded V8 heap is the quickest way to be killed by the OS.
             "NODE_OPTIONS" to "--max-old-space-size=512",
         )
-        return runProcess(ctx, args, onOutput, environment)
+        return runProcess(ctx, args, onOutput, environment, stdin)
     }
 }
 
@@ -215,6 +217,7 @@ class NpmCommand(runtimeManager: RuntimeManager) : UserspaceCommand(runtimeManag
             args = listOf(cliJs.absolutePath) + args,
             workingDirectory = ctx.cwd,
             environment = environment,
+            stdin = stdin,
             onOutput = onOutput,
         )
 

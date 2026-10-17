@@ -73,7 +73,11 @@ class GitHubDeviceFlowAuth(
             throw GitHubException(ErrorKind.NETWORK, "Could not reach GitHub to start sign-in.", cause = e)
         }
 
-        val parsed = json.decodeFromString<DeviceCodeWire>(text)
+        val parsed = try {
+            json.decodeFromString<DeviceCodeWire>(text)
+        } catch (e: Exception) {
+            throw GitHubException(ErrorKind.NETWORK, "GitHub's sign-in reply could not be read.", cause = e)
+        }
         if (parsed.error != null) {
             throw GitHubException(ErrorKind.AUTH, parsed.errorDescription ?: parsed.error)
         }
@@ -134,7 +138,11 @@ class GitHubDeviceFlowAuth(
                 throw GitHubException(ErrorKind.NETWORK, "Lost connection while waiting for GitHub sign-in.", cause = e)
             }
 
-            val parsed = json.decodeFromString<TokenWire>(text)
+            val parsed = try {
+                json.decodeFromString<TokenWire>(text)
+            } catch (e: Exception) {
+                throw GitHubException(ErrorKind.NETWORK, "GitHub's sign-in reply could not be read.", cause = e)
+            }
             when (parsed.error) {
                 null -> {
                     val token = parsed.accessToken

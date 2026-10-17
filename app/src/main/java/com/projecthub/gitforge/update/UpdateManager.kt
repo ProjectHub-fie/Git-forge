@@ -68,7 +68,25 @@ class UpdateManager(private val context: Context) {
         asset: UpdateAsset,
         onProgress: (UpdateProgress) -> Unit = {},
     ): InstallResult = withContext(Dispatchers.IO) {
-        val target = File(installDir, asset.name)
+        // Release assets come from GitHub (browser_download_url); only HTTPS is
+        // ever legitimate. Reject anything else before touching disk or network.
+        val scheme = runCatching { android.net.Uri.parse(asset.url).scheme }.getOrNull()
+        if (!scheme.equals("https", ignoreCase = true)) {
+            return@withContext InstallResult.Failed("Refusing to download from a non-HTTPS URL.")
+        }
+        val safeName = asset.name.substringAfterLast('/').substringAfterLast('\\')
+        if (safeName.isBlank() || !safeName.matches(Regex("[A-Za-z0-9._-]+"))) {
+            return@withContext InstallResult.Failed("Refusing to stage an asset with an unsafe file name.")
+        }
+        val target = File(installDir, safeName)
+        // Canonical-path containment: a crafted name must never escape the sandbox.
+        val dirCanonical = runCatching { installDir.canonicalPath }.getOrNull()
+        val targetCanonical = runCatching { target.canonicalPath }.getOrNull()
+        if (dirCanonical == null || targetCanonical == null ||
+            !(targetCanonical == dirCanonical || targetCanonical.startsWith("$dirCanonical${File.separatorChar}"))
+        ) {
+            return@withContext InstallResult.Failed("Refusing to stage an asset outside the update directory.")
+        }
         try {
             if (target.exists()) target.delete()
 
@@ -113,10 +131,15 @@ class UpdateManager(private val context: Context) {
                 )
             }
 
-            val signerCheck = compareSigners(target)
-            if (signerCheck != null) {
-                target.delete()
-                return@withContext signerCheck
+            // Fail closed: only a clean bill (null) proceeds. Every other
+            // verdict — mismatch, unreadable certs, or any future variant —
+            // discards the download instead of installing it.
+            when (val signerCheck = compareSigners(target)) {
+                null -> Unit
+                else -> {
+                    target.delete()
+                    return@withContext signerCheck
+                }
             }
 
             onProgress(UpdateProgress.ReadyToInstall)
@@ -131,12 +154,16 @@ class UpdateManager(private val context: Context) {
 
     /**
      * Returns a [InstallResult.SignatureMismatch] when the staged APK is signed by a
-     * different key than the running app, or null when the signers match.
+     * different key than the running app, an [InstallResult.Failed] when either
+     * side cannot be read (fail closed: unverifiable means untrusted), or null
+     * when the signers match.
      */
-    private fun compareSigners(apk: File): InstallResult.SignatureMismatch? {
+    private fun compareSigners(apk: File): InstallResult? {
         val pm = context.packageManager
-        val installed = currentSignatures(pm) ?: return null
-        val candidate = apkSignatures(pm, apk) ?: return null
+        val installed = currentSignatures(pm)
+            ?: return InstallResult.Failed("Could not verify the installed app's signature.")
+        val candidate = apkSignatures(pm, apk)
+            ?: return InstallResult.Failed("Could not verify the downloaded APK's signature.")
 
         // A release build and a debug build are signed with different keys, so a
         // debug build following the release channel (or vice versa) is refused here

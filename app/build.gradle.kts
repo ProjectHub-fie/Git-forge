@@ -48,9 +48,10 @@ android {
 
         ndk {
             // The Termux userspace packages GitForge installs on demand are built
-            // for arm64-v8a. Nothing native is bundled in the APK, so this only
-            // declares which devices the app is offered to.
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            // for arm64-v8a only. Nothing native is bundled in the APK, so this only
+            // declares which devices the app is offered to: offering armeabi-v7a or
+            // x86_64 would install an app whose runtimes can never run there.
+            abiFilters += listOf("arm64-v8a")
         }
     }
 

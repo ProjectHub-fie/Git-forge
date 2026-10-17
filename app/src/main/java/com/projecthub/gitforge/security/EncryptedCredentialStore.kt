@@ -42,20 +42,42 @@ class EncryptedCredentialStore(context: Context) : CredentialStore {
 
     override fun tokenType(): String? = read(KEY_TOKEN_TYPE)
 
+    /**
+     * Eagerly opens the encrypted file, forcing Keystore + MasterKey creation.
+     * Returns false (and logs) when the device cannot provide secure storage, so
+     * [AppContainer] can fall back to [UnavailableCredentialStore] at startup
+     * instead of discovering the failure on first use.
+     */
+    fun probe(): Boolean = try {
+        prefs.getString(KEY_TOKEN, null)
+        true
+    } catch (t: Throwable) {
+        AppLog.w("Encrypted credential store probe failed", t)
+        false
+    }
+
     override fun save(token: String, login: String?, scopes: String?, tokenType: String?) {
-        prefs.edit()
-            .putString(KEY_TOKEN, token)
-            .putString(KEY_LOGIN, login)
-            .putString(KEY_SCOPES, scopes)
-            .putString(KEY_TOKEN_TYPE, tokenType)
-            .apply()
-        // Deliberately does not log the token or any derivative of it.
-        AppLog.i("Stored GitHub credential for ${Redaction.redact(login ?: "unknown account")}")
+        try {
+            prefs.edit()
+                .putString(KEY_TOKEN, token)
+                .putString(KEY_LOGIN, login)
+                .putString(KEY_SCOPES, scopes)
+                .putString(KEY_TOKEN_TYPE, tokenType)
+                .apply()
+            // Deliberately does not log the token or any derivative of it.
+            AppLog.i("Stored GitHub credential for ${Redaction.redact(login ?: "unknown account")}")
+        } catch (t: Throwable) {
+            AppLog.w("Could not store the GitHub credential", t)
+        }
     }
 
     override fun clear() {
-        prefs.edit().clear().apply()
-        AppLog.i("Cleared stored GitHub credential")
+        try {
+            prefs.edit().clear().apply()
+            AppLog.i("Cleared stored GitHub credential")
+        } catch (t: Throwable) {
+            AppLog.w("Could not clear the stored GitHub credential", t)
+        }
     }
 
     private fun read(key: String): String? = try {

@@ -328,6 +328,22 @@ class GitViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
+    /** Aborts an in-progress merge, restoring the tree to HEAD. Offered while conflicts exist. */
+    fun abortMerge() {
+        val root = _state.value.repositoryRoot ?: return
+        viewModelScope.launch {
+            _state.update { it.copy(busyMessage = "Aborting merge…") }
+            val result = appResult { container.gitEngine.abortMerge(root) }
+            when (result) {
+                is AppResult.Success -> {
+                    _state.update { it.copy(busyMessage = null, lastMergeOutcome = null, message = "Merge aborted.") }
+                    refresh()
+                }
+                is AppResult.Failure -> _state.update { it.copy(busyMessage = null, errorMessage = result.error.message) }
+            }
+        }
+    }
+
     fun mergeBranch(name: String) {
         val root = _state.value.repositoryRoot ?: return
         viewModelScope.launch {

@@ -28,7 +28,12 @@ class ShellContext(
     @Throws(IOException::class)
     fun resolve(path: String): File {
         if (path.isEmpty()) return cwd
-        val expanded = path.replace("~", home.absolutePath)
+        // Only a leading `~` refers to home; a `~` elsewhere is a literal name.
+        val expanded = when {
+            path == "~" -> home.absolutePath
+            path.startsWith("~/") -> home.absolutePath + path.removePrefix("~")
+            else -> path
+        }
         val file = File(expanded)
         val resolved = (if (file.isAbsolute) file else File(cwd, expanded)).canonicalFile
         if (allowedRoots.isNotEmpty() &&
@@ -70,10 +75,13 @@ data class ShellRunOutput(
  */
 object GlobExpander {
 
-    fun expand(args: List<String>, cwd: File): List<String> {
+    fun expand(args: List<String>, cwd: File, quoted: List<Boolean> = emptyList()): List<String> {
         val result = mutableListOf<String>()
-        for (arg in args) {
-            if (!arg.contains('*') && !arg.contains('?') && !arg.contains('[')) {
+        for ((index, arg) in args.withIndex()) {
+            // Quoted words never glob; `[..]` below is documented as supported.
+            if (quoted.getOrNull(index) == true ||
+                (!arg.contains('*') && !arg.contains('?') && !arg.contains('['))
+            ) {
                 result += arg
                 continue
             }
@@ -93,6 +101,7 @@ object GlobExpander {
         return dir.listFiles()
             ?.asSequence()
             ?.filter { it.name != ".git" }
+            ?.filter { namePart.startsWith(".") || !it.name.startsWith(".") }
             ?.filter { regex.matches(it.name) }
             ?.sortedBy { it.name.lowercase() }
             ?.map { if (dirPart.isEmpty()) it.name else "$dirPart/${it.name}" }
@@ -102,13 +111,32 @@ object GlobExpander {
 
     private fun globToRegex(glob: String): Regex {
         val sb = StringBuilder("^")
-        for (c in glob) {
+        var j = 0
+        while (j < glob.length) {
+            val c = glob[j]
             when (c) {
                 '*' -> sb.append("[^/]*")
                 '?' -> sb.append("[^/]")
+                '[' -> {
+                    val end = glob.indexOf(']', j + 1)
+                    if (end == -1) {
+                        sb.append(Regex.escape("["))
+                        j++
+                        continue
+                    }
+                    val body = glob.substring(j + 1, end)
+                    val negated = body.startsWith("!") || body.startsWith("^")
+                    val chars = if (negated) body.drop(1) else body
+                    sb.append(if (negated) "[^" else "[")
+                    for (ch in chars) sb.append(Regex.escape(ch.toString()))
+                    sb.append("]")
+                    j = end + 1
+                    continue
+                }
                 '.' -> sb.append("\\.")
                 else -> if (c.isLetterOrDigit()) sb.append(c) else sb.append(Regex.escape(c.toString()))
             }
+            j++
         }
         sb.append("$")
         return Regex(sb.toString())

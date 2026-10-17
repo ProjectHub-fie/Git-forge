@@ -15,7 +15,9 @@ import com.projecthub.gitforge.github.Paged
 import com.projecthub.gitforge.git.GitOperationException
 import com.projecthub.gitforge.git.RepoStatus
 import com.projecthub.gitforge.workspace.WorkspaceUsage
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -82,15 +84,20 @@ class RepositoriesViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             _state.update { it.copy(loadingLocal = true) }
             val entities = container.database.repositoryDao().all()
-            val items = entities.map { entity ->
-                val dir = runCatching { container.workspaceManager.resolveRelative(entity.localPath) }.getOrNull()
-                val exists = dir?.isDirectory == true
-                val status = if (exists && !entity.isLocalOnly) {
-                    runCatching { container.gitEngine.status(dir!!) }.getOrNull()
-                } else {
-                    null
+            // Filesystem and JGit reads run on the IO dispatcher so a large
+            // workspace never blocks Main; the engine confines its own blocking
+            // calls to IO as well.
+            val items = withContext(Dispatchers.IO) {
+                entities.map { entity ->
+                    val dir = runCatching { container.workspaceManager.resolveRelative(entity.localPath) }.getOrNull()
+                    val exists = dir?.isDirectory == true
+                    val status = if (exists && !entity.isLocalOnly) {
+                        runCatching { container.gitEngine.status(dir!!) }.getOrNull()
+                    } else {
+                        null
+                    }
+                    RepositoryListItem(entity, status, exists)
                 }
-                RepositoryListItem(entity, status, exists)
             }
             _state.update {
                 it.copy(
@@ -169,6 +176,9 @@ class RepositoriesViewModel(private val container: AppContainer) : ViewModel() {
     fun onSearchQueryChange(query: String) {
         _state.update { it.copy(searchQuery = query) }
         searchJob?.cancel()
+        // Local list filters synchronously; only hit the network when remote
+        // results are visible: a token exists and the filter is not LOCAL.
+        if (_state.value.filter == RepositoryFilter.LOCAL || !container.credentialStore.hasToken()) return
         // Debounce so typing does not fire a request per keystroke.
         searchJob = viewModelScope.launch {
             kotlinx.coroutines.delay(350)

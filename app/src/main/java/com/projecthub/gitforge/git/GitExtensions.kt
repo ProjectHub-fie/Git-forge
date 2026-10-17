@@ -25,7 +25,7 @@ fun RevCommit.toCommitInfo(): CommitInfo = CommitInfo(
  * here with a longest-common-subsequence walk over the two blobs. The walk is
  * bounded by [maxLines] so a very large file cannot stall the UI thread.
  */
-fun DiffEntry.toFileDiff(repository: Repository, maxLines: Int = 5000): FileDiff {
+fun DiffEntry.toFileDiff(repository: Repository, maxLines: Int = 2000): FileDiff {
     val changeType = when (changeType) {
         DiffEntry.ChangeType.ADD -> ChangeType.ADDED
         DiffEntry.ChangeType.MODIFY -> ChangeType.MODIFIED
@@ -72,7 +72,20 @@ fun DiffEntry.toFileDiff(repository: Repository, maxLines: Int = 5000): FileDiff
     )
 }
 
-private fun AbbreviatedObjectId.toObjectId(): ObjectId = ObjectId.fromString(name())
+/**
+ * Resolves an abbreviated id through the object database. JGit diff entries can
+ * carry shortened ids, which [ObjectId.fromString] rejects; resolving first
+ * keeps the diff working for those entries.
+ */
+private fun AbbreviatedObjectId.toObjectId(repository: Repository): ObjectId? = runCatching {
+    if (name().length >= 40) {
+        ObjectId.fromString(name())
+    } else {
+        // resolve() returns every object matching the prefix; an abbreviated
+        // diff id must match exactly one, otherwise fall back to the worktree.
+        repository.newObjectReader().use { reader -> reader.resolve(this@toObjectId).singleOrNull() }
+    }
+}.getOrNull()
 
 /**
  * Reads one side of a diff.
@@ -82,19 +95,30 @@ private fun AbbreviatedObjectId.toObjectId(): ObjectId = ObjectId.fromString(nam
  * is tried first and the working tree is the fallback; a null path means the side
  * does not exist (a pure addition or deletion).
  */
-private fun readSide(repository: Repository, id: AbbreviatedObjectId, path: String?): List<String> {
-    val objectId = id.toObjectId()
-    if (objectId != ObjectId.zeroId()) {
-        readBlobLinesOrNull(repository, objectId)?.let { return it }
+private fun readSide(
+    repository: Repository,
+    id: AbbreviatedObjectId,
+    path: String?,
+    maxBytes: Long = 1L * 1024 * 1024,
+): List<String> {
+    val objectId = id.toObjectId(repository)
+    if (objectId != null && objectId != ObjectId.zeroId()) {
+        readBlobLinesOrNull(repository, objectId, maxBytes)?.let { return it }
     }
     if (path == null) return emptyList()
     val file = File(repository.workTree, path)
     if (!file.isFile) return emptyList()
+    if (file.length() > maxBytes) return listOf("<file too large for diff>")
     val bytes = runCatching { file.readBytes() }.getOrNull() ?: return emptyList()
     return if (looksBinary(bytes)) emptyList<String>() else bytes.toString(Charsets.UTF_8).split('\n')
 }
 
-private fun readBlobLinesOrNull(repository: Repository, id: ObjectId): List<String>? = try {
+private fun readBlobLinesOrNull(repository: Repository, id: ObjectId, maxBytes: Long = 1L * 1024 * 1024): List<String>? = try {
+    repository.newObjectReader().use { reader ->
+        if (reader.getObjectSize(id, org.eclipse.jgit.lib.ObjectReader.OBJ_ANY) > maxBytes) {
+            return listOf("<blob too large for diff>")
+        }
+    }
     val bytes = repository.open(id).bytes
     if (looksBinary(bytes)) emptyList() else bytes.toString(Charsets.UTF_8).split('\n')
 } catch (_: Throwable) {

@@ -264,4 +264,54 @@ class FileOperationsTest {
         val entries = reader.list(root, "src")
         assertTrue(entries.any { it.name == "main" && it.isDirectory })
     }
+
+    @Test
+    fun `save is refused when the size changed but the timestamp did not`() {
+        val root = repo()
+        val file = File(root, "notes.txt")
+        file.writeText("original\n")
+        val content = ops.read(root, "notes.txt")
+        // Same-millisecond replacement: timestamp spoofed back, size differs.
+        file.writeText("original plus more\n")
+        file.setLastModified(content.lastModified)
+        try {
+            ops.write(
+                root = root,
+                relativePath = "notes.txt",
+                text = "my edit\n",
+                lineEnding = content.lineEnding,
+                charsetName = content.charsetName,
+                expectedLastModified = content.lastModified,
+                expectedSizeBytes = content.sizeBytes,
+            )
+            fail("A save over a same-timestamp replacement must be refused")
+        } catch (_: IOException) {
+            // Expected.
+        }
+        assertEquals("original plus more\n", file.readText())
+    }
+
+    @Test
+    fun `save is refused when the file was deleted on disk`() {
+        val root = repo()
+        val file = File(root, "gone.txt")
+        file.writeText("original\n")
+        val content = ops.read(root, "gone.txt")
+        assertTrue(file.delete())
+        try {
+            ops.write(
+                root = root,
+                relativePath = "gone.txt",
+                text = "resurrected\n",
+                lineEnding = content.lineEnding,
+                charsetName = content.charsetName,
+                expectedLastModified = content.lastModified,
+                expectedSizeBytes = content.sizeBytes,
+            )
+            fail("A save over a deleted file must be refused")
+        } catch (_: IOException) {
+            // Expected: reload instead of resurrect.
+        }
+        assertFalse(File(root, "gone.txt").exists())
+    }
 }

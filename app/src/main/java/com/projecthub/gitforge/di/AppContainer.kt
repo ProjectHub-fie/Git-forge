@@ -70,7 +70,13 @@ class AppContainer(private val context: Context) {
      * written to Diagnostics, where the user can read it without adb.
      */
     val credentialStore: CredentialStore by lazy {
-        runCatching { EncryptedCredentialStore(context) as CredentialStore }
+        runCatching {
+            val store = EncryptedCredentialStore(context)
+            // Eager probe: EncryptedSharedPreferences/MasterKey are lazy, so a
+            // constructor alone never throws. Force the Keystore open here.
+            check(store.probe()) { "Encrypted credential store probe failed" }
+            store as CredentialStore
+        }
             .getOrElse { failure ->
                 AppLog.e("Secure credential storage is unavailable on this device", failure)
                 UnavailableCredentialStore(failure)
@@ -128,10 +134,14 @@ class AppContainer(private val context: Context) {
      * can never disagree about the index. The rest come from the installed userspace.
      */
     fun buildRuntimeCommands(): List<ExternalCommand> = listOf(
-        GitCommand(gitEngine) {
-            val settings = settingsRepository.snapshot()
-            commitIdentity(settings)
-        },
+        GitCommand(
+            gitEngine = gitEngine,
+            identityProvider = {
+                val settings = settingsRepository.snapshot()
+                commitIdentity(settings)
+            },
+            tokenProvider = { credentialStore.token() },
+        ),
         NodeCommand(runtimeManager),
         NpmCommand(runtimeManager),
         PythonCommand(runtimeManager),

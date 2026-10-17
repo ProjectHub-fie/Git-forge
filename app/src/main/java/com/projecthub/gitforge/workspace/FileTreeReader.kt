@@ -1,5 +1,6 @@
 package com.projecthub.gitforge.workspace
 
+import com.projecthub.gitforge.core.PathSafety
 import java.io.File
 
 data class FileNode(
@@ -23,7 +24,11 @@ data class FileNode(
 class FileTreeReader(private val maxEntriesPerDirectory: Int = 2000) {
 
     fun list(root: File, relativeDir: String): List<FileNode> {
-        val dir = if (relativeDir.isBlank()) root else File(root, relativeDir)
+        val dir = if (relativeDir.isBlank()) {
+            root
+        } else {
+            PathSafety.resolveExistingInside(root, relativeDir)
+        }
         if (!dir.isDirectory) return emptyList()
 
         val children = dir.listFiles() ?: return emptyList()
@@ -44,5 +49,5 @@ class FileTreeReader(private val maxEntriesPerDirectory: Int = 2000) {
     }
 
     private fun relative(file: File, root: File): String =
-        file.absolutePath.removePrefix(root.absolutePath).trimStart(File.separatorChar).replace(File.separatorChar, '/')
+        PathSafety.relativize(root, file)
 }

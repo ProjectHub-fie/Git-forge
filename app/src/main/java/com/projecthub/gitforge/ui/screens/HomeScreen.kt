@@ -98,7 +98,7 @@ fun HomeScreen(
                         "cloning, pulling and pushing need an account.",
                     tone = com.projecthub.gitforge.ui.components.BannerTone.INFO,
                     actionLabel = "Connect",
-                    onAction = { onNavigate("settings") },
+                    onAction = { onNavigate(com.projecthub.gitforge.ui.nav.Destination.SETTINGS.route) },
                     modifier = Modifier.padding(horizontal = 16.dp),
                 )
                 Spacer(Modifier.height(8.dp))
@@ -109,8 +109,8 @@ fun HomeScreen(
             QuickActions(
                 onCreateLocalProject = onCreateLocalProject,
                 onCloneRepository = onCloneRepository,
-                onOpenEditor = { onNavigate("editor") },
-                onOpenTerminal = { onNavigate("terminal") },
+                onOpenEditor = { onNavigate(com.projecthub.gitforge.ui.nav.Destination.EDITOR.route) },
+                onOpenTerminal = { onNavigate(com.projecthub.gitforge.ui.nav.Destination.TERMINAL.route) },
             )
         }
 

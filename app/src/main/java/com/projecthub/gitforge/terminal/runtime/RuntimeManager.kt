@@ -165,7 +165,12 @@ class RuntimeManager(private val filesRoot: File) {
         installation()
     }
 
-    private fun packagesFor(groups: Set<RuntimeGroup>): List<TermuxPackage> {
+    /**
+     * The exact package list an install of [groups] will download, de-duplicated
+     * by name. Public so the install-confirm dialog can quote the same numbers
+     * instead of double-counting the shared `commonPackages`.
+     */
+    fun packagesFor(groups: Set<RuntimeGroup>): List<TermuxPackage> {
         val result = linkedMapOf<String, TermuxPackage>()
         // COMMON first: certificates are needed by both HTTPS clients.
         if (groups.isNotEmpty()) {

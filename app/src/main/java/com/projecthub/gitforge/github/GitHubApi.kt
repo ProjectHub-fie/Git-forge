@@ -117,7 +117,14 @@ class GitHubApi(
         val encodedPath = path.split('/').filter { it.isNotEmpty() }.joinToString("/") { encodeSegment(it) }
         val suffix = if (encodedPath.isEmpty()) "" else "/$encodedPath"
         val query: Map<String, String> = ref?.let { mapOf("ref" to it) } ?: emptyMap()
-        return get("/repos/$owner/$name/contents$suffix", ListSerializer(GitHubContent.serializer()), query)
+        // A directory decodes as an array; a single file decodes as one object.
+        val raw: kotlinx.serialization.json.JsonElement =
+            get("/repos/$owner/$name/contents$suffix", kotlinx.serialization.json.JsonElement.serializer(), query)
+        return if (raw is kotlinx.serialization.json.JsonArray) {
+            json.decodeFromJsonElement(ListSerializer(GitHubContent.serializer()), raw)
+        } else {
+            listOf(json.decodeFromJsonElement(GitHubContent.serializer(), raw))
+        }
     }
 
     /** Creates or updates a file directly through the API (used for small edits). */
@@ -235,14 +242,23 @@ class GitHubApi(
 
         val status = response.code
         val remaining = response.header("X-RateLimit-Remaining")
-        val reset = response.header("X-RateLimit-Reset")?.toLongOrNull()
+        val resetHeader = response.header("X-RateLimit-Reset")?.toLongOrNull()
+        val retryAfterSecs = response.header("Retry-After")?.toLongOrNull()
         val errorBody = runCatching { response.body?.string() }.getOrNull().orEmpty()
         response.close()
 
         val detail = extractMessage(errorBody)
+        // Honor Retry-After when the reset header is absent (429s often omit it).
+        val reset = resetHeader ?: retryAfterSecs?.let { (System.currentTimeMillis() / 1000) + it }
+        val rateLimitMessage = (detail.orEmpty() + " " + errorBody).let {
+            it.contains("rate limit", ignoreCase = true) ||
+                it.contains("abuse", ignoreCase = true) ||
+                it.contains("secondary rate", ignoreCase = true)
+        }
         val kind = when {
             status == 401 -> ErrorKind.AUTH
-            status == 403 && remaining == "0" -> ErrorKind.RATE_LIMIT
+            status == 429 -> ErrorKind.RATE_LIMIT
+            status == 403 && (remaining == "0" || retryAfterSecs != null || rateLimitMessage) -> ErrorKind.RATE_LIMIT
             status == 403 -> ErrorKind.AUTH
             status == 404 -> ErrorKind.NOT_FOUND
             status == 409 -> ErrorKind.CONFLICT

@@ -5,7 +5,7 @@ import java.io.IOException
 
 /** A token produced by [ShellLexer]. */
 sealed interface Token {
-    data class Word(val value: String, val quoted: Boolean) : Token
+    data class Word(val value: String, val quoted: Boolean, val singleQuoted: Boolean = false) : Token
     data class Operator(val symbol: String) : Token
 }
 
@@ -17,6 +17,8 @@ data class ShellStage(
     val stderrFile: File? = null,
     val stderrAppend: Boolean = false,
     val stdinFile: File? = null,
+    /** Parallel to [words]: true when the word was quoted and must skip glob expansion. */
+    val quoted: List<Boolean> = emptyList(),
 ) {
     val command: String get() = words.firstOrNull().orEmpty()
     val arguments: List<String> get() = words.drop(1)
@@ -47,13 +49,15 @@ object ShellLexer {
         val tokens = mutableListOf<Token>()
         val word = StringBuilder()
         var wordQuoted = false
+        var wordHasNonSingle = false
         var i = 0
 
         fun flush() {
             if (word.isNotEmpty() || wordQuoted) {
-                tokens += Token.Word(word.toString(), wordQuoted)
+                tokens += Token.Word(word.toString(), wordQuoted, singleQuoted = wordQuoted && !wordHasNonSingle)
                 word.setLength(0)
                 wordQuoted = false
+                wordHasNonSingle = false
             }
         }
 
@@ -62,6 +66,7 @@ object ShellLexer {
             when {
                 c == '\\' && i + 1 < input.length -> {
                     word.append(input[i + 1])
+                    wordHasNonSingle = true
                     i += 2
                 }
 
@@ -87,6 +92,7 @@ object ShellLexer {
                     if (!closed) throw ShellSyntaxException("Unterminated double quote")
                     word.append(sb)
                     wordQuoted = true
+                    wordHasNonSingle = true
                     i = j + 1
                 }
 
@@ -123,7 +129,7 @@ object ShellLexer {
 
                 c.isWhitespace() -> { flush(); i++ }
 
-                else -> { word.append(c); i++ }
+                else -> { word.append(c); wordHasNonSingle = true; i++ }
             }
         }
         flush()
@@ -135,6 +141,8 @@ object ShellLexer {
      * variable containing a space cannot inject an extra argument.
      */
     fun expand(word: Token.Word, env: Map<String, String>, lastExitCode: Int, home: String): String {
+        // Single-quoted words are literal: no tilde or variable expansion.
+        if (word.singleQuoted) return word.value
         if (!word.quoted && word.value == "~") return home
         if (!word.quoted && word.value.startsWith("~/")) {
             return home + word.value.removePrefix("~")
@@ -185,6 +193,7 @@ object ShellLexer {
 
         val stages = mutableListOf<ShellStage>()
         var currentWords = mutableListOf<String>()
+        var currentQuoted = mutableListOf<Boolean>()
         var stdoutFile: File? = null
         var stdoutAppend = false
         var stderrFile: File? = null
@@ -201,9 +210,11 @@ object ShellLexer {
                     stderrFile = stderrFile,
                     stderrAppend = stderrAppend,
                     stdinFile = stdinFile,
+                    quoted = currentQuoted,
                 )
             }
             currentWords = mutableListOf()
+            currentQuoted = mutableListOf()
             stdoutFile = null
             stdoutAppend = false
             stderrFile = null
@@ -211,17 +222,35 @@ object ShellLexer {
             stdinFile = null
         }
 
+        // `cmd1 & cmd2` is two foreground commands, and this engine runs one
+        // command at a time; reject `&` loudly instead of merging or blocking.
+        fun checkBackgroundPlacement(index: Int) {
+            val hasWordsBefore = currentWords.isNotEmpty() || stages.isNotEmpty()
+            if (!hasWordsBefore || index + 1 >= tokens.size) {
+                throw ShellSyntaxException("background jobs are not supported; run the command separately")
+            }
+        }
+
         var i = 0
         while (i < tokens.size) {
             when (val token = tokens[i]) {
                 is Token.Word -> {
                     currentWords += token.value
+                    // Words quoted in any way keep their literal text for glob;
+                    // single-quoted words additionally skipped variable expansion.
+                    currentQuoted += token.quoted
                     i++
                 }
 
                 is Token.Operator -> when (token.symbol) {
-                    "|" -> { finishStage(); i++ }
-                    "&" -> { background = true; i++ }
+                    "|" -> {
+                        if (currentWords.isEmpty()) throw ShellSyntaxException("Empty command in pipeline")
+                        finishStage(); i++
+                    }
+                    "&" -> {
+                        checkBackgroundPlacement(i)
+                        throw ShellSyntaxException("background jobs are not supported; run the commands separately")
+                    }
                     "&&" -> throw ShellSyntaxException("'&&' chaining is not supported; run the commands separately")
                     ">", ">>" -> {
                         val target = tokens.getOrNull(i + 1) as? Token.Word
@@ -250,6 +279,9 @@ object ShellLexer {
         finishStage()
 
         if (stages.isEmpty()) throw ShellSyntaxException("Empty command")
+        if (tokens.first() is Token.Operator || tokens.last() is Token.Operator) {
+            throw ShellSyntaxException("Empty command in pipeline")
+        }
         return ShellPipeline(stages = stages, raw = raw, background = background)
     }
 }

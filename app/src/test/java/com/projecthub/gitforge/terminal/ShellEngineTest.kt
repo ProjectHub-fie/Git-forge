@@ -161,11 +161,22 @@ class ShellEngineTest {
     }
 
     @Test
-    fun `grep returns a non zero exit code when nothing matches`() {
+    fun `grep -c still reports a count when nothing matches`() {
         val dir = temp.newFolder("work")
-        File(dir, "log.txt").writeText("nothing here\n")
-        val result = run(dir, "grep missing log.txt")
-        assertTrue(result.exitCode != 0)
+        File(dir, "log.txt").writeText("error: one\ninfo: two\nerror: three\n")
+        assertEquals("2", run(dir, "grep -c error log.txt").stdout.trim())
+        // A zero count must be printed, not omitted; only the exit code differs.
+        val none = run(dir, "grep -c missing log.txt")
+        assertEquals("0", none.stdout.trim())
+        assertTrue(none.exitCode != 0)
+    }
+
+    @Test
+    fun `grep -c counts matches arriving on stdin`() {
+        val dir = temp.newFolder("work")
+        File(dir, "log.txt").writeText("error: one\ninfo: two\nerror: three\n")
+        val result = run(dir, "cat log.txt | grep -c error")
+        assertEquals("2", result.stdout.trim())
     }
 
     @Test
@@ -288,5 +299,73 @@ class ShellEngineTest {
         secret.writeText("do not read me\n")
         val result = run(dir, "cat ../secret.txt")
         assertTrue("the read must not succeed", result.exitCode != 0 || !result.stdout.contains("do not read me"))
+    }
+
+    @Test
+    fun `single quotes suppress variable expansion`() {
+        val dir = temp.newFolder("work")
+        val session = Session(dir)
+        session.run("export FOO=expanded")
+        // \$FOO keeps the dollar literal; a bare $FOO is a Kotlin template.
+        val result = session.run("echo '\$FOO'")
+        assertEquals("\$FOO", result.stdout.trim())
+        assertFalse(result.stdout.contains("expanded"))
+    }
+
+    @Test
+    fun `double quotes still expand variables`() {
+        val dir = temp.newFolder("work")
+        val session = Session(dir)
+        session.run("export FOO=expanded")
+        val result = session.run("echo \"\$FOO\"")
+        assertTrue(result.stdout.contains("expanded"))
+    }
+
+    @Test
+    fun `quoted globs do not expand`() {
+        val dir = temp.newFolder("work")
+        File(dir, "a.kt").writeText("x")
+        val result = run(dir, "echo \"*.kt\"")
+        assertEquals("""*.kt""", result.stdout.trim())
+    }
+
+    @Test
+    fun `input redirection feeds a file as stdin`() {
+        val dir = temp.newFolder("work")
+        File(dir, "in.txt").writeText("hello-stdin\n")
+        val result = run(dir, "cat < in.txt")
+        assertEquals(0, result.exitCode)
+        assertTrue(result.stdout.contains("hello-stdin"))
+    }
+
+    @Test
+    fun `missing input redirection file is an error`() {
+        val dir = temp.newFolder("work")
+        val result = run(dir, "cat < nope.txt")
+        assertTrue(result.exitCode != 0)
+    }
+
+    @Test
+    fun `background jobs are rejected loudly`() {
+        val dir = temp.newFolder("work")
+        val result = run(dir, "sleep 5 &")
+        assertTrue(result.exitCode != 0)
+        assertTrue(result.stderr.contains("background"))
+    }
+
+    @Test
+    fun `empty pipeline stages are a syntax error`() {
+        val dir = temp.newFolder("work")
+        val result = run(dir, "echo hi |")
+        assertTrue(result.exitCode != 0)
+    }
+
+    @Test
+    fun `env overrides do not leak into the session`() {
+        val dir = temp.newFolder("work")
+        val session = Session(dir)
+        session.run("env LEAK_TEST=1 true")
+        val result = session.run("echo \$LEAK_TEST")
+        assertEquals("", result.stdout.trim())
     }
 }

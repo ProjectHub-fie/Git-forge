@@ -20,37 +20,57 @@ class AnsiParser {
     private var carryStyle = AnsiStyle.NONE
 
     /** Feeds a raw chunk and returns the completed lines plus any partial tail. */
+    @kotlin.jvm.Synchronized
     fun parse(chunk: String, carry: String): ParseOutcome {
-        val buffer = StringBuilder(carry)
+        // A chunk boundary can split an escape sequence or an ESC [ itself:
+        // rejoin a dangling `"\u001B"` / `"\u001B["` / `"\u001B[12"` tail from the
+        // previous carry before scanning, so split SGR never leaks literally.
+        val (rejoined, pending) = rejoinSplitEscape(carry)
+        val buffer = StringBuilder(rejoined)
         val lines = mutableListOf<Pair<String, AnsiStyle>>()
 
         // Style in effect when the current line's first character was written.
         var lineStyle = if (buffer.isEmpty()) current else carryStyle
         var index = 0
-        while (index < chunk.length) {
-            val char = chunk[index]
+        val text = pending + chunk
+        while (index < text.length) {
+            val char = text[index]
             when {
-                char == '\u001B' && index + 1 < chunk.length && chunk[index + 1] == '[' -> {
-                    val end = findSequenceEnd(chunk, index + 2)
+                char == '\u001B' && index + 1 < text.length && text[index + 1] == '[' -> {
+                    val end = findSequenceEnd(text, index + 2)
                     if (end == -1) {
-                        // Sequence split across chunks; keep it for the next call.
-                        buffer.append(chunk.substring(index))
-                        index = chunk.length
+                        // Sequence split across chunks; stash for the next call.
+                        val dangling = text.substring(index)
+                        buffer.append(dangling)
+                        index = text.length
                     } else {
-                        applySgr(chunk.substring(index + 2, end))
+                        applySgr(text.substring(index + 2, end))
                         index = end + 1
                     }
                 }
 
+                char == '\u001B' && index + 1 >= text.length -> {
+                    // Chunk ended on a bare ESC; hold it for the next chunk.
+                    buffer.append(text.substring(index))
+                    index = text.length
+                }
+
                 char == '\r' -> {
-                    // Overwrite the current line: drop everything buffered so far.
-                    val lastNewline = buffer.lastIndexOf("\n")
-                    if (lastNewline >= 0) {
-                        buffer.delete(lastNewline + 1, buffer.length)
-                    } else {
+                    if (index + 1 < text.length && text[index + 1] == '\n') {
+                        // CRLF is one newline, not an overwrite plus a newline.
+                        lines += buffer.toString() to lineStyle
                         buffer.setLength(0)
+                        index += 2
+                    } else {
+                        // Overwrite the current line: drop everything buffered so far.
+                        val lastNewline = buffer.lastIndexOf("\n")
+                        if (lastNewline >= 0) {
+                            buffer.delete(lastNewline + 1, buffer.length)
+                        } else {
+                            buffer.setLength(0)
+                        }
+                        index++
                     }
-                    index++
                 }
 
                 char == '\n' -> {
@@ -71,6 +91,26 @@ class AnsiParser {
 
         carryStyle = if (buffer.isEmpty()) current else lineStyle
         return ParseOutcome(lines = lines, carry = buffer.toString(), style = current)
+    }
+
+    /**
+     * Splits a carry into settled text plus a dangling incomplete escape tail.
+     * A previous chunk may have ended mid-SGR (for example `"\u001B[3"`); that
+     * tail is not content and must be re-scanned together with the next chunk.
+     */
+    private fun rejoinSplitEscape(carry: String): Pair<String, String> {
+        val esc = carry.lastIndexOf('\u001B')
+        if (esc < 0) return carry to ""
+        val tail = carry.substring(esc)
+        // A complete sequence ends with a final byte in @..~; without one the
+        // tail is still open and belongs with the next chunk.
+        val open = when {
+            tail.length == 1 -> true
+            tail[1] != '[' -> false
+            else -> tail.substring(2).none { it in '@'..'~' }
+        }
+        if (!open) return carry to ""
+        return carry.substring(0, esc) to tail
     }
 
     /** Strips every escape sequence from a string without styling it. */

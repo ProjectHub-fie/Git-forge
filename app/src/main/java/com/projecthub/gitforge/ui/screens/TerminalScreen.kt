@@ -70,6 +70,8 @@ import com.projecthub.gitforge.ui.components.InfoBanner
 import com.projecthub.gitforge.ui.components.StatusChip
 import com.projecthub.gitforge.ui.theme.TerminalColors
 import com.projecthub.gitforge.ui.theme.TerminalTextStyle
+import androidx.compose.foundation.isSystemInDarkTheme
+import com.projecthub.gitforge.ui.theme.DarkTerminal
 import com.projecthub.gitforge.ui.theme.LightTerminal
 
 /**
@@ -94,7 +96,7 @@ fun TerminalScreen(
     var showSessionMenu by remember { mutableStateOf(false) }
     var showStopConfirm by remember { mutableStateOf(false) }
     var pendingCommand by remember { mutableStateOf<String?>(null) }
-    val terminalColors = LightTerminal
+    val terminalColors = if (isSystemInDarkTheme()) DarkTerminal else LightTerminal
 
     LaunchedEffect(state.lines.size) {
         if (state.lines.isNotEmpty()) {
@@ -298,9 +300,15 @@ fun TerminalScreen(
 private fun isRiskyCommand(command: String): Boolean {
     val normalised = command.trim()
     if (normalised.contains("--ignore-scripts")) return false
-    val first = normalised.split(Regex("\\s+")).firstOrNull() ?: return false
-    if (first != "npm") return false
-    return Regex("""\bnpm\s+(install|i|ci|add|update|rebuild|link)\b""").containsMatchIn(normalised)
+    // Split pipelines/redirects into segments so `echo x | npm install` and
+    // `npm --prefix dir install` cannot bypass the confirmation dialog.
+    return normalised.split('|', ';', '&', '>', '<').any { segment ->
+        val tokens = segment.trim().split(Regex("\\s+"))
+        val npmIndex = tokens.indexOfFirst { it == "npm" || it.endsWith("/npm") }
+        if (npmIndex < 0) return@any false
+        val sub = tokens.drop(npmIndex + 1).firstOrNull { !it.startsWith("-") } ?: return@any false
+        sub in setOf("install", "i", "ci", "add", "update", "rebuild", "link") || sub == "run"
+    }
 }
 
 @Composable

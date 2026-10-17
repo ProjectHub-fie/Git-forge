@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 data class TerminalUiState(
@@ -49,6 +51,8 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
     val state: StateFlow<TerminalUiState> = _state.asStateFlow()
 
     private var outputJob: kotlinx.coroutines.Job? = null
+    private var stateJob: kotlinx.coroutines.Job? = null
+    private val runMutex = Mutex()
 
     init {
         viewModelScope.launch {
@@ -87,12 +91,13 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
         manager.select(id)
         val session = manager.session(id) ?: return
         outputJob?.cancel()
+        stateJob?.cancel()
         outputJob = viewModelScope.launch {
             session.output.collect { lines ->
                 _state.update { it.copy(lines = lines) }
             }
         }
-        viewModelScope.launch {
+        stateJob = viewModelScope.launch {
             session.state.collect { s ->
                 _state.update {
                     it.copy(
@@ -125,9 +130,12 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
     /** Runs an explicit command, used by quick-action chips and package shortcuts. */
     fun runCommand(command: String) {
         val session = manager.active() ?: manager.createSession()
+        if (_state.value.busy) return
         viewModelScope.launch {
-            _state.update { it.copy(busy = true) }
-            val result = session.run(command)
+            val result = runMutex.withLock {
+                _state.update { it.copy(busy = true) }
+                session.run(command)
+            }
             _state.update {
                 it.copy(
                     busy = false,
@@ -194,6 +202,7 @@ class TerminalViewModel(private val container: AppContainer) : ViewModel() {
     override fun onCleared() {
         // Sessions deliberately survive; only the output subscription is dropped.
         outputJob?.cancel()
+        stateJob?.cancel()
         super.onCleared()
     }
 }

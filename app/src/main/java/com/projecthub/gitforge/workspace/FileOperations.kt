@@ -2,7 +2,11 @@ package com.projecthub.gitforge.workspace
 
 import com.projecthub.gitforge.core.PathSafety
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 
@@ -87,6 +91,9 @@ class FileOperations(private val maxEditableBytes: Long = 4L * 1024 * 1024) {
      * @param expectedLastModified when non-null, the write is rejected if the file
      *   on disk was modified after this timestamp, which detects the case where a
      *   terminal command or another tool changed the file while the tab was open.
+     * @param expectedSizeBytes when non-null alongside [expectedLastModified], the
+     *   write is also rejected if the on-disk size differs, so a same-millisecond
+     *   replacement that keeps the timestamp cannot slip past the mtime check.
      */
     fun write(
         root: File,
@@ -95,11 +102,16 @@ class FileOperations(private val maxEditableBytes: Long = 4L * 1024 * 1024) {
         lineEnding: LineEnding,
         charsetName: String,
         expectedLastModified: Long? = null,
+        expectedSizeBytes: Long? = null,
     ): SaveResult {
         val target = PathSafety.resolveInside(root, relativePath)
         if (target.isDirectory) throw IOException("$relativePath is a directory")
 
-        if (expectedLastModified != null && target.exists() && target.lastModified() > expectedLastModified) {
+        if (expectedLastModified != null &&
+            (!target.exists() ||
+                target.lastModified() != expectedLastModified ||
+                (expectedSizeBytes != null && target.length() != expectedSizeBytes))
+        ) {
             throw IOException(
                 "Refusing to overwrite $relativePath: the file changed on disk since it was opened.",
             )
@@ -111,12 +123,29 @@ class FileOperations(private val maxEditableBytes: Long = 4L * 1024 * 1024) {
 
         target.parentFile?.let { if (!it.exists() && !it.mkdirs()) throw IOException("Cannot create ${it.name}") }
 
-        // Atomic write: the rename replaces the old file in one step.
-        val temp = File(target.parentFile, ".${target.name}.gitforge.tmp")
-        temp.writeBytes(bytes)
-        if (!temp.renameTo(target)) {
-            temp.copyTo(target, overwrite = true)
-            temp.delete()
+        // Pseudo-atomic write: unique temp file plus fsync plus an atomic rename,
+        // so a crash mid-save cannot leave a half-written file behind.
+        val parent = target.parentFile ?: throw IOException("Cannot resolve parent of $relativePath")
+        val temp = File.createTempFile(".${target.name}.", ".gitforge.tmp", parent)
+        try {
+            FileOutputStream(temp).use { stream ->
+                stream.write(bytes)
+                stream.fd.sync()
+            }
+            try {
+                Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } catch (t: Throwable) {
+            runCatching { temp.delete() }
+            if (t is IOException) throw t
+            throw IOException("Could not write $relativePath: ${t.message}", t)
         }
 
         return SaveResult(

@@ -36,43 +36,92 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun current(): AppSettings = context.settingsDataStore.data.first().toSettings().also { cache = it }
 
-    suspend fun setThemeMode(mode: ThemeMode) = edit { it[Keys.THEME_MODE] = mode.name }
-
-    suspend fun setDynamicColor(enabled: Boolean) = edit { it[Keys.DYNAMIC_COLOR] = enabled }
-
-    suspend fun setEditorFontSize(sp: Int) = edit {
-        it[Keys.EDITOR_FONT_SP] = sp.coerceIn(AppSettings.MIN_EDITOR_FONT_SP, AppSettings.MAX_EDITOR_FONT_SP)
+    suspend fun setThemeMode(mode: ThemeMode) {
+        edit { it[Keys.THEME_MODE] = mode.name }
+        cache = cache.copy(themeMode = mode)
     }
 
-    suspend fun setEditorTabSize(size: Int) = edit { it[Keys.EDITOR_TAB_SIZE] = size.coerceIn(1, 8) }
-
-    suspend fun setEditorSoftWrap(enabled: Boolean) = edit { it[Keys.EDITOR_SOFT_WRAP] = enabled }
-
-    suspend fun setEditorLineNumbers(enabled: Boolean) = edit { it[Keys.EDITOR_LINE_NUMBERS] = enabled }
-
-    suspend fun setTerminalFontSize(size: TerminalFontSize) = edit { it[Keys.TERMINAL_FONT] = size.name }
-
-    suspend fun setTerminalScrollback(lines: Int) = edit {
-        it[Keys.TERMINAL_SCROLLBACK] = lines.coerceIn(AppSettings.MIN_SCROLLBACK, AppSettings.MAX_SCROLLBACK)
+    suspend fun setDynamicColor(enabled: Boolean) {
+        edit { it[Keys.DYNAMIC_COLOR] = enabled }
+        cache = cache.copy(useDynamicColor = enabled)
     }
 
-    suspend fun setAutoFetch(enabled: Boolean) = edit { it[Keys.AUTO_FETCH] = enabled }
+    suspend fun setEditorFontSize(sp: Int) {
+        val coerced = sp.coerceIn(AppSettings.MIN_EDITOR_FONT_SP, AppSettings.MAX_EDITOR_FONT_SP)
+        edit { it[Keys.EDITOR_FONT_SP] = coerced }
+        cache = cache.copy(editorFontSizeSp = coerced)
+    }
 
-    suspend fun setConfirmDestructive(enabled: Boolean) = edit { it[Keys.CONFIRM_DESTRUCTIVE] = enabled }
+    suspend fun setEditorTabSize(size: Int) {
+        val coerced = size.coerceIn(1, 8)
+        edit { it[Keys.EDITOR_TAB_SIZE] = coerced }
+        cache = cache.copy(editorTabSize = coerced)
+    }
 
-    suspend fun setWarnRepoScripts(enabled: Boolean) = edit { it[Keys.WARN_REPO_SCRIPTS] = enabled }
+    suspend fun setEditorSoftWrap(enabled: Boolean) {
+        edit { it[Keys.EDITOR_SOFT_WRAP] = enabled }
+        cache = cache.copy(editorSoftWrap = enabled)
+    }
 
-    suspend fun setLastActiveRepository(id: Long) = edit { it[Keys.LAST_REPO_ID] = id }
+    suspend fun setEditorLineNumbers(enabled: Boolean) {
+        edit { it[Keys.EDITOR_LINE_NUMBERS] = enabled }
+        cache = cache.copy(editorShowLineNumbers = enabled)
+    }
 
-    suspend fun setOnboardingCompleted(completed: Boolean) = edit { it[Keys.ONBOARDING_DONE] = completed }
+    suspend fun setTerminalFontSize(size: TerminalFontSize) {
+        edit { it[Keys.TERMINAL_FONT] = size.name }
+        cache = cache.copy(terminalFontSize = size)
+    }
 
-    suspend fun setGitAuthor(name: String, email: String) = edit {
-        it[Keys.GIT_AUTHOR_NAME] = name.trim()
-        it[Keys.GIT_AUTHOR_EMAIL] = email.trim()
+    suspend fun setTerminalScrollback(lines: Int) {
+        val coerced = lines.coerceIn(AppSettings.MIN_SCROLLBACK, AppSettings.MAX_SCROLLBACK)
+        edit { it[Keys.TERMINAL_SCROLLBACK] = coerced }
+        cache = cache.copy(terminalScrollbackLines = coerced)
+    }
+
+    suspend fun setAutoFetch(enabled: Boolean) {
+        edit { it[Keys.AUTO_FETCH] = enabled }
+        cache = cache.copy(autoFetchOnOpen = enabled)
+    }
+
+    suspend fun setConfirmDestructive(enabled: Boolean) {
+        edit { it[Keys.CONFIRM_DESTRUCTIVE] = enabled }
+        cache = cache.copy(confirmDestructiveGitOperations = enabled)
+    }
+
+    suspend fun setWarnRepoScripts(enabled: Boolean) {
+        edit { it[Keys.WARN_REPO_SCRIPTS] = enabled }
+        cache = cache.copy(warnBeforeRunningRepositoryScripts = enabled)
+    }
+
+    suspend fun setLastActiveRepository(id: Long) {
+        edit { it[Keys.LAST_REPO_ID] = id }
+        cache = cache.copy(lastActiveRepositoryId = id)
+    }
+
+    suspend fun setOnboardingCompleted(completed: Boolean) {
+        edit { it[Keys.ONBOARDING_DONE] = completed }
+        cache = cache.copy(onboardingCompleted = completed)
+    }
+
+    suspend fun setGitAuthor(name: String, email: String) {
+        val trimmedName = name.trim()
+        val trimmedEmail = email.trim()
+        edit {
+            it[Keys.GIT_AUTHOR_NAME] = trimmedName
+            it[Keys.GIT_AUTHOR_EMAIL] = trimmedEmail
+        }
+        cache = cache.copy(gitAuthorName = trimmedName, gitAuthorEmail = trimmedEmail)
     }
 
     private suspend fun edit(block: (androidx.datastore.preferences.core.MutablePreferences) -> Unit) {
-        context.settingsDataStore.edit(block)
+        try {
+            context.settingsDataStore.edit(block)
+        } catch (e: java.io.IOException) {
+            // DataStore reads/writes hit disk; a failing write must not crash the
+            // caller. The optimistic cache above still reflects the intent.
+            AppLog.w("Could not persist settings", e)
+        }
     }
 
     private fun Preferences.toSettings(): AppSettings = AppSettings(

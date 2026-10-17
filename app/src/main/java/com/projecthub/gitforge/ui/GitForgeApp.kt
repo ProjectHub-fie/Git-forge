@@ -127,10 +127,17 @@ fun GitForgeApp(
     val navigate: (String) -> Unit = { route ->
         coroutineScope.launch {
             drawerState.close()
-            navController.navigate(route) {
-                popUpTo(Destination.HOME.route) { saveState = true }
-                launchSingleTop = true
-                restoreState = true
+            val primary = Destination.primary.any { it.route == route }
+            if (primary) {
+                navController.navigate(route) {
+                    popUpTo(Destination.HOME.route) { saveState = true }
+                    launchSingleTop = true
+                    restoreState = true
+                }
+            } else {
+                navController.navigate(route) {
+                    launchSingleTop = true
+                }
             }
         }
     }
@@ -192,10 +199,12 @@ fun GitForgeApp(
                 modifier = Modifier.fillMaxSize(),
                 snackbarHost = { SnackbarHost(snackbarHostState) },
                 topBar = {
+                    val canGoBack = navController.previousBackStackEntry != null
                     ScreenTopBar(
                         title = current.label,
+                        onBack = if (canGoBack) ({ navController.navigateUp() }) else null,
                         actions = {
-                            if (!useRail) {
+                            if (!useRail && !canGoBack) {
                                 IconButton(onClick = { coroutineScope.launch { drawerState.open() } }) {
                                     Icon(Icons.Default.Menu, contentDescription = "Open navigation drawer")
                                 }
@@ -284,6 +293,22 @@ fun GitForgeApp(
                                 viewModel = packagesViewModel,
                                 activeRepositoryId = activeRepositoryId,
                                 onRunInTerminal = { command ->
+                                    // Bind the session to the repo first: TerminalScreen's
+                                    // ensureSession runs after navigation and would otherwise
+                                    // lose this race, executing npm in the previous cwd.
+                                    if (activeRepositoryId > 0) {
+                                        val root = repositoriesState.localRepositories
+                                            .firstOrNull { it.entity.id == activeRepositoryId }
+                                            ?.let {
+                                                runCatching {
+                                                    container.workspaceManager.resolveRelative(it.entity.localPath)
+                                                }.getOrNull()
+                                            }
+                                        if (root != null && root.isDirectory) {
+                                            terminalViewModel.ensureSession(root)
+                                            terminalViewModel.setWorkingDirectory(root.absolutePath)
+                                        }
+                                    }
                                     navigate(Destination.TERMINAL.route)
                                     terminalViewModel.runCommand(command)
                                 },

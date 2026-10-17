@@ -45,6 +45,9 @@ object NativeProcess {
         workingDirectory: File,
         environment: Map<String, String>,
         timeoutSeconds: Long = 0,
+        stdin: String = "",
+        stdinLimitBytes: Int = 2 * 1024 * 1024,
+        outputLimitChars: Int = 2 * 1024 * 1024,
         onOutput: (String, TerminalLine.Stream) -> Unit = { _, _ -> },
     ): ProcessOutcome = withContext(Dispatchers.IO) {
         val command = ProcessInvocation.command(executable, args, android.os.Build.VERSION.SDK_INT)
@@ -69,8 +72,19 @@ object NativeProcess {
             )
         }
 
-        val stdoutBuilder = StringBuilder()
-        val stderrBuilder = StringBuilder()
+        // Feed pipeline stdin (already capped by the caller) then close so the
+        // child sees EOF instead of hanging forever on an open pipe.
+        if (stdin.isNotEmpty()) {
+            val bytes = stdin.toByteArray(Charsets.UTF_8).take(stdinLimitBytes).toByteArray()
+            runCatching {
+                process.outputStream.use { it.write(bytes) }
+            }
+        } else {
+            runCatching { process.outputStream.close() }
+        }
+
+        val stdoutBuilder = CappedAppend(outputLimitChars)
+        val stderrBuilder = CappedAppend(outputLimitChars)
         val cancelled = AtomicBoolean(false)
 
         val stdoutThread = Thread {
@@ -142,10 +156,35 @@ object NativeProcess {
 
         ProcessOutcome(
             exitCode = if (timedOut) 124 else process.exitValue(),
-            stdout = stdoutBuilder.toString(),
-            stderr = stderrBuilder.toString(),
-            timedOut = timedOut,
+            stdout = stdoutBuilder.content(),
+            stderr = stderrBuilder.content(),
+            timedOut = timedOut || stdoutBuilder.truncated || stderrBuilder.truncated,
         )
+    }
+
+    /** Bounded appender: keeps the first [limit] chars so a runaway process cannot OOM. */
+    private class CappedAppend(private val limit: Int) {
+        private val sb = StringBuilder()
+        var truncated = false
+            private set
+
+        @kotlin.jvm.Synchronized
+        fun append(chunk: String) {
+            if (sb.length >= limit) {
+                truncated = true
+                return
+            }
+            val room = limit - sb.length
+            if (chunk.length > room) {
+                sb.append(chunk, 0, room)
+                truncated = true
+            } else {
+                sb.append(chunk)
+            }
+        }
+
+        @kotlin.jvm.Synchronized
+        fun content(): String = sb.toString()
     }
 
     /**
@@ -158,5 +197,5 @@ object NativeProcess {
         workingDirectory: File,
         environment: Map<String, String>,
         timeoutSeconds: Long = 20,
-    ): ProcessOutcome = run(executable, args, workingDirectory, environment, timeoutSeconds)
+    ): ProcessOutcome = run(executable, args, workingDirectory, environment, timeoutSeconds = timeoutSeconds)
 }

@@ -59,5 +59,12 @@ suspend fun <T> appResult(block: suspend () -> T): AppResult<T> = try {
 
 fun Throwable.toAppError(): AppError {
     val safeMessage = Redaction.redact(message ?: this::class.java.simpleName)
+    // Preserve the classified kind so callers keep targeted recovery actions.
+    if (this is com.projecthub.gitforge.git.GitOperationException) {
+        return AppError(kind = kind, message = safeMessage, cause = this)
+    }
+    if (this is com.projecthub.gitforge.github.GitHubException) {
+        return AppError(kind = kind, message = safeMessage, cause = this)
+    }
     return AppError(kind = ErrorKind.UNKNOWN, message = safeMessage, cause = this)
 }

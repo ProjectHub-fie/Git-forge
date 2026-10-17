@@ -12,8 +12,9 @@ object Redaction {
     const val MASK = "***REDACTED***"
 
     private val patterns: List<Regex> = listOf(
-        // GitHub token families.
-        Regex("""gh[pousr]_[A-Za-z0-9]{16,}"""),
+        // GitHub token families, including newer gha_/ghd_ (attestations/caches) and
+        // any future gh*_ prefix. Bare "gh_" alone is never matched: 16+ chars required.
+        Regex("""gh[a-z]_[A-Za-z0-9]{16,}"""),
         Regex("""github_pat_[A-Za-z0-9_]{20,}"""),
         // Any bearer/authorization header value.
         Regex("""(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"""),
@@ -22,8 +23,9 @@ object Redaction {
         Regex("""(?i)(https?://)[^/\s:@]+:[^/\s@]+@"""),
         // Common credential query/body parameters.
         Regex("""(?i)\b(access_token|refresh_token|client_secret|token|password|passwd|pwd|apikey|api_key)\s*[:=]\s*["']?[^\s"'&,;]+"""),
-        // Long opaque hex blobs that look like keys.
-        Regex("""\b[A-Fa-f0-9]{40,}\b"""),
+        // 64-char hex (SHA-256 digests / private-key material). 40-char SHAs are
+        // deliberately left alone so commit ids stay readable in messages.
+        Regex("""\b[A-Fa-f0-9]{64}\b"""),
     )
 
     fun redact(input: String?): String {

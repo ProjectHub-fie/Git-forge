@@ -6,6 +6,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   release:
     types: [published]
 
@@ -32,32 +35,41 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
-      - name: Build Debug and Release APKs
+      - name: Run unit tests
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug assembleRelease
+          ./gradlew --no-daemon :app:testDebugUnitTest
 
-      - name: Rename APKs
+      - name: Build Debug and Release APKs
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk GitForge-debug.apk
-          cp app/build/outputs/apk/release/app-release-unsigned.apk GitForge-release-unsigned.apk
+          ./gradlew --no-daemon :app:assembleDebug :app:assembleRelease
+
+      - name: Stage updater-compatible APK names
+        # The in-app updater selects app-debug.apk / app-release.apk (see
+        # UpdateModels.assetFor). Keep those exact names so the staged files
+        # match the channel contract instead of failing late after download.
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk app-debug.apk
+          cp app/build/outputs/apk/release/app-release-unsigned.apk app-release.apk
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: GitForge-APKs
           path: |
-            GitForge-debug.apk
-            GitForge-release-unsigned.apk
+            app-debug.apk
+            app-release.apk
 
-      - name: Attach APKs to GitHub Release
+      # The release APK here is unsigned (no keystore in CI): it proves the
+      # build compiles but cannot update an installed app. Attach the debug APK
+      # for testers; do NOT attach the unsigned release APK to a release.
+      - name: Attach debug APK to GitHub Release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           gh release upload "$TAG_NAME" \
-            GitForge-debug.apk \
-            GitForge-release-unsigned.apk \
+            app-debug.apk \
             --clobber
 

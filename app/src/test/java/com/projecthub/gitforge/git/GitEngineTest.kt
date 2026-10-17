@@ -357,4 +357,66 @@ class GitEngineTest {
             // Expected.
         }
     }
+
+    @Test
+    fun `setting a remote strips credentials from the url`() = runBlocking {
+        val repo = newRepo()
+        engine.setRemote(repo, "origin", "https://x-access-token:secret123@github.com/example/project.git")
+        val remotes = engine.remotes(repo)
+        assertEquals(1, remotes.size)
+        assertFalse(remotes.first().fetchUrl.contains("secret123"))
+        assertTrue(remotes.first().fetchUrl.startsWith("https://github.com/"))
+    }
+
+    @Test
+    fun `setting a remote rejects non-https urls`() = runBlocking {
+        val repo = newRepo()
+        try {
+            engine.setRemote(repo, "origin", "git@github.com:example/project.git")
+            fail("Non-HTTPS remote URLs must be rejected")
+        } catch (_: GitOperationException) {
+            // Expected: only https:// remotes are stored.
+        }
+    }
+
+    @Test
+    fun `merge refuses a dirty tree instead of failing midway`() = runBlocking {
+        val repo = newRepo()
+        File(repo, "base.txt").writeText("base\n")
+        engine.stage(repo, listOf("base.txt"))
+        commit(repo)
+        engine.createBranch(repo, "feature", checkout = false)
+        File(repo, "dirty.txt").writeText("uncommitted\n")
+        try {
+            engine.merge(repo, "feature")
+            fail("Merge over uncommitted changes must be refused")
+        } catch (_: GitOperationException) {
+            // Expected: commit or discard first.
+        }
+    }
+
+    @Test
+    fun `abort merge restores the tree after a conflict`() = runBlocking {
+        val repo = newRepo()
+        File(repo, "conflict.txt").writeText("base\n")
+        engine.stage(repo, listOf("conflict.txt"))
+        commit(repo)
+        val mainBranch = engine.status(repo).branch
+
+        engine.createBranch(repo, "other", checkout = true)
+        File(repo, "conflict.txt").writeText("other change\n")
+        engine.stage(repo, listOf("conflict.txt"))
+        commit(repo, "other change")
+
+        engine.checkout(repo, mainBranch)
+        File(repo, "conflict.txt").writeText("main change\n")
+        engine.stage(repo, listOf("conflict.txt"))
+        commit(repo, "main change")
+
+        val outcome = engine.merge(repo, "other")
+        assertEquals(MergeStatus.CONFLICTING, outcome.status)
+        engine.abortMerge(repo)
+        assertFalse(File(repo, ".git/MERGE_HEAD").exists())
+        assertTrue(engine.status(repo).conflicting.isEmpty())
+    }
 }
